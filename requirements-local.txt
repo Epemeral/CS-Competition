@@ -1,0 +1,2 @@
+# Development only. Keep the organizer's PyTorch/DTK stack on DCU.
+transformers==4.51.3

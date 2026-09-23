@@ -122,7 +122,7 @@ code("""
 import subprocess, sys
 base = [sys.executable, "scripts/qwen25_amdgpu_benchmark.py",
         "--model", MODEL_DIR, "--model-source", "transformers",
-        "--batch-sizes", "1,2,4,8", "--input-tokens", "512",
+        "--batch-sizes", "1,2,4,8,16,32", "--input-tokens", "512",
         "--max-new-tokens", "128", "--warmup", "2", "--repeats", "5"]
 subprocess.run(base + ["--attention", "eager", "--output", "results/amdgpu_eager.json"], check=True)
 subprocess.run(base + ["--attention", "sdpa", "--output", "results/amdgpu_sdpa.json"], check=True)

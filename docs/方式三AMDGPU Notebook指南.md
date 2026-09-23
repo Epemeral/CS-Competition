@@ -37,7 +37,7 @@ python scripts/qwen25_amdgpu_benchmark.py \
   --model-source transformers \
   --attention sdpa \
   --dtype bfloat16 \
-  --batch-sizes 1,2,4,8 \
+  --batch-sizes 1,2,4,8,16,32 \
   --input-tokens 512 \
   --max-new-tokens 128 \
   --warmup 2 \

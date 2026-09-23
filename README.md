@@ -29,5 +29,6 @@ python -m venv --system-site-packages .venv
 - `docs/后续步骤.md`：DCU 账号到位后的路线。
 - `docs/方式三AMDGPU Notebook指南.md`：方式三环境的安装、基线和优化顺序。
 - `docs/数据集接入计划.md`：五个外部数据集的用途、优先级和 Notebook 接入顺序。
+- `docs/Notebook文件更新教程.md`：生成、同步、运行和提交 Notebook 的操作步骤。
 
 拿到组委会镜像后，以官方 `baseline.py`、`evaluate.py`、模型路径和评测集为准，并把环境信息写入实验记录。

@@ -85,6 +85,9 @@ BRANCH = "feat/t4-triton-kernels"
 WORKDIR = "/mnt/data/CS-Competition"
 if not os.path.exists(os.path.join(WORKDIR, ".git")):
     !git clone --depth 1 --branch {BRANCH} {REPO} {WORKDIR}
+else:
+    # 仓库已存在时只做快进更新，不覆盖 Notebook 中未提交的本地修改。
+    !git -C {WORKDIR} pull --ff-only origin {BRANCH}
 %cd /mnt/data/CS-Competition
 !git log -1 --oneline
 """)

@@ -51,45 +51,100 @@ print('Platform:', platform.platform())
 
 code("""
 from pathlib import Path
-import sys
+import importlib
+import shutil
 import subprocess
+import sys
 
 ROOT = Path.cwd()
+REPO = 'https://github.com/Epemeral/CS-Competition.git'
+BRANCH = 'feat/t4-triton-kernels'
+CLONE_DIR = Path('/content/cs-comp')
+
+# 判据不只是「文件在不在」，还要「版本够不够新」。
+# 旧版 reference.py 的 qkv_split_rope 没有 num_key_value_heads 参数，
+# 会导致后面整个 GQA 流程跑不通 —— 这是个典型的「文件在、但内容旧」陷阱。
+GQA_MARKER = 'num_key_value_heads: int | None = None'
+
+
 def is_kernel_tree(path):
     return (path / 'src' / 'reference.py').is_file() and \\
            (path / 'tests' / 'test_correctness.py').is_file()
 
+
+def supports_gqa(path):
+    ref = path / 'src' / 'reference.py'
+    if not ref.is_file():
+        return False
+    return GQA_MARKER in ref.read_text(encoding='utf-8')
+
+
+def sync_from_github(target):
+    \"\"\"强制从 GitHub 拉最新代码，覆盖 target。失败则抛异常。\"\"\"
+    if target.exists():
+        shutil.rmtree(target)
+    print(f'从 GitHub 拉取最新 {BRANCH} ...')
+    subprocess.run(['git', 'clone', '-b', BRANCH, '--depth', '1',
+                    REPO, str(target)], check=True)
+
+
+# ---- 1. 先找本地已有的 kernels ----
 candidates = [
     ROOT / 'kernels',
     ROOT,
-    Path('/content/cs-comp/kernels'),
+    CLONE_DIR / 'kernels',
     Path('/content/CS-Competition/kernels'),
 ]
 KERNELS = next((p for p in candidates if is_kernel_tree(p)), None)
 
+# ---- 2. 没找到，或找到了但版本太旧 → 都去 GitHub 拉 ----
 if KERNELS is None:
-    target = Path('/content/cs-comp')
-    repo = 'https://github.com/Epemeral/CS-Competition.git'
-    print('未发现完整 kernels 源码，尝试下载 feat/t4-triton-kernels ...')
+    print('未发现 kernels 源码，尝试从 GitHub 下载 ...')
     try:
-        subprocess.run(['git', 'clone', '-b', 'feat/t4-triton-kernels',
-                        '--depth', '1', repo, str(target)], check=True)
+        sync_from_github(CLONE_DIR)
+        KERNELS = CLONE_DIR / 'kernels'
     except Exception as exc:
         raise RuntimeError(
             '无法自动获取仓库。请将仓库中的 kernels 文件夹上传到 '
-            '/content/cs-comp/kernels 后，重新运行本单元。原始错误: ' + repr(exc)
+            f'{CLONE_DIR}/kernels 后重新运行本单元。原始错误: ' + repr(exc)
         ) from exc
-    KERNELS = target / 'kernels'
+elif not supports_gqa(KERNELS):
+    print(f'⚠️  本地 kernels 版本过旧（不支持 GQA）: {KERNELS}')
+    print('   尝试从 GitHub 拉取最新版本 ...')
+    try:
+        sync_from_github(CLONE_DIR)
+        KERNELS = CLONE_DIR / 'kernels'
+    except Exception as exc:
+        print('   拉取失败，继续用本地旧版 —— 后面会报错，请手动更新。')
+        print('   原因:', repr(exc))
+else:
+    print(f'✅ 本地 kernels 已是最新（支持 GQA）: {KERNELS}')
 
+# ---- 3. 最终校验 ----
 if not is_kernel_tree(KERNELS):
     raise FileNotFoundError(
         f'找到的路径不完整: {KERNELS}。需要 src/reference.py 和 tests/test_correctness.py。'
     )
+if not supports_gqa(KERNELS):
+    raise RuntimeError(
+        f'当前 kernels 仍不支持 GQA（缺少 num_key_value_heads 参数）: {KERNELS}\\n'
+        '请强制更新：\\n'
+        f'  !rm -rf {CLONE_DIR} && git clone -b {BRANCH} --depth 1 {REPO} {CLONE_DIR}\\n'
+        '然后 Runtime -> Restart session，从头重跑。'
+    )
+
+# ---- 4. 清掉 Python 缓存的旧模块（换了文件但内存里还是旧对象）----
+for name in ('reference', 'triton_kernels', 'bench_utils'):
+    sys.modules.pop(name, None)
+importlib.invalidate_caches()
+
 SRC = KERNELS / 'src'
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+print()
 print('KERNELS =', KERNELS)
 print('reference.py =', SRC / 'reference.py')
+print('已清除 reference / triton_kernels / bench_utils 的模块缓存')
 """)
 
 md("""

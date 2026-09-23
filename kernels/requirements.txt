@@ -1,0 +1,24 @@
+# Triton Kernel 工程依赖
+#
+# 注意：Google Colab 已经预装了 torch 和 triton，通常不需要额外安装。
+# 本地 / DCU 集群上才需要按下面的说明装。
+
+torch>=2.0
+triton>=2.1
+numpy
+
+# ---------------------------------------------------------------
+# DCU 集群专用说明（重要）
+# ---------------------------------------------------------------
+# 海光 DCU 上不能用 PyPI 的通用 triton，必须用 DAS 官方适配版：
+#
+#   triton-3.5.1+das.opt1.dtk2604.torch290-cp310-cp310-manylinux_2_28_x86_64.whl
+#
+# 下载地址（DAS 官方 wheel 仓库，注意 URL 里没有 api-static）：
+#   https://download.sourcefind.cn:65024/file/4/triton/DAS1.8/
+#
+# 版本必须和环境严格对齐：
+#   triton 3.5.1 + dtk2604 + torch290 + cp310
+#
+# 装错了会报 UnicodeDecodeError（AMD 驱动解析设备属性出错），
+# 这个错误很难定位，务必按上面的版本号来。

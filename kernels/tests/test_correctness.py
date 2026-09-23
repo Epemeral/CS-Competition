@@ -122,7 +122,7 @@ def test_rmsnorm(rep: Report, device: str):
 # 二、融合 Add + RMSNorm
 # ============================================================
 def test_fused_add_rmsnorm(rep: Report, device: str):
-    print("\n【融合 Add + RMSNorm】v1=整行处理 / v2=分块归约")
+    print("\n【融合 Add + RMSNorm】v1=整行处理 / v2=分块归约 / v3=两阶段")
     for shape in SHAPES:
         for dtype, atol, rtol in DTYPES:
             x = torch.randn(*shape, device=device, dtype=dtype)
@@ -132,11 +132,14 @@ def test_fused_add_rmsnorm(rep: Report, device: str):
             y_ref, h_ref = ref.fused_add_rmsnorm(x, r, w, eps=1e-6)
             y_v1, h_v1 = tk.fused_add_rmsnorm(x, r, w, eps=1e-6)
             y_v2, h_v2 = tk.fused_add_rmsnorm_v2(x, r, w, eps=1e-6)
+            y_v3, h_v3 = tk.fused_add_rmsnorm_v3(x, r, w, eps=1e-6)
 
             ok1 = (torch.allclose(y_ref, y_v1, atol=atol, rtol=rtol)
                    and torch.allclose(h_ref, h_v1, atol=atol, rtol=rtol))
             ok2 = (torch.allclose(y_ref, y_v2, atol=atol, rtol=rtol)
                    and torch.allclose(h_ref, h_v2, atol=atol, rtol=rtol))
+            ok3 = (torch.allclose(y_ref, y_v3, atol=atol, rtol=rtol)
+                   and torch.allclose(h_ref, h_v3, atol=atol, rtol=rtol))
 
             label = f"{str(shape):>14}  {str(dtype).split('.')[-1]:<16}"
             detail = ""
@@ -146,7 +149,10 @@ def test_fused_add_rmsnorm(rep: Report, device: str):
             if not ok2:
                 detail += (f"v2 y误差 {max_abs_diff(y_ref, y_v2):.2e} "
                            f"h误差 {max_abs_diff(h_ref, h_v2):.2e}")
-            rep.check(label, ok1 and ok2, detail)
+            if not ok3:
+                detail += (f"v3 y误差 {max_abs_diff(y_ref, y_v3):.2e} "
+                           f"h误差 {max_abs_diff(h_ref, h_v3):.2e}")
+            rep.check(label, ok1 and ok2 and ok3, detail)
 
 
 # ============================================================

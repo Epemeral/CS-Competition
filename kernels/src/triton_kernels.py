@@ -256,6 +256,84 @@ def fused_add_rmsnorm_v2(
     return y.view_as(x), h.view_as(x)
 
 
+# ---- v3：两阶段大 N 版 ----
+# v2 的第二遍会再次读取 X/R 并重新计算 h。v3 第一阶段直接把 h 写入，
+# 第二阶段只读取 h 做归一化，从而减少大 N 时的输入带宽压力。
+@triton.jit
+def _add_rmsnorm_stage1_kernel(
+    X, R, H, PARTIAL,
+    stride_x_row, stride_h_row, stride_partial_row,
+    N, BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = block * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = cols < N
+    x = tl.load(X + row * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
+    r = tl.load(R + row * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
+    h = x + r
+    tl.store(H + row * stride_h_row + cols, h.to(H.dtype.element_ty), mask=mask)
+    tl.store(PARTIAL + row * stride_partial_row + block,
+             tl.sum(h * h, axis=0))
+
+
+@triton.jit
+def _add_rmsnorm_stage2_kernel(
+    H, W, Y, PARTIAL,
+    stride_h_row, stride_y_row, stride_partial_row,
+    N, NUM_BLOCKS, eps, BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    sum_sq = 0.0
+    for block in range(0, NUM_BLOCKS):
+        sum_sq += tl.load(PARTIAL + row * stride_partial_row + block)
+    rrms = 1.0 / tl.sqrt(sum_sq / N + eps)
+
+    for block in range(0, NUM_BLOCKS):
+        cols = block * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = cols < N
+        h = tl.load(H + row * stride_h_row + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+        tl.store(Y + row * stride_y_row + cols,
+                 (h * rrms * w).to(Y.dtype.element_ty), mask=mask)
+
+
+def fused_add_rmsnorm_v3(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    block_cap: int = 4096,
+):
+    """Two-stage Add+RMSNorm for large N; keeps the same (y, h) contract."""
+    assert x.is_cuda
+    x = x.contiguous()
+    residual = residual.contiguous()
+    N = x.shape[-1]
+    if N <= block_cap:
+        return fused_add_rmsnorm(x, residual, weight, eps)
+
+    x2d = x.view(-1, N)
+    r2d = residual.view(-1, N)
+    M = x2d.shape[0]
+    num_blocks = triton.cdiv(N, block_cap)
+    y = torch.empty_like(x2d)
+    h = torch.empty_like(x2d)
+    partial = torch.empty((M, num_blocks), device=x.device, dtype=torch.float32)
+
+    _add_rmsnorm_stage1_kernel[(M, num_blocks)](
+        x2d, r2d, h, partial,
+        x2d.stride(0), h.stride(0), partial.stride(0),
+        N, BLOCK_N=block_cap,
+    )
+    _add_rmsnorm_stage2_kernel[(M,)](
+        h, weight, y, partial,
+        h.stride(0), y.stride(0), partial.stride(0),
+        N, num_blocks, eps, BLOCK_N=block_cap,
+    )
+    return y.view_as(x), h.view_as(x)
+
+
 # ============================================================
 # 三、SwiGLU
 # ============================================================

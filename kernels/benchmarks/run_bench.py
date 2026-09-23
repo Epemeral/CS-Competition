@@ -116,8 +116,8 @@ def bench_fusion_gain(device, peak_bw, results):
     print("=" * 96)
     print("融合收益：分开做 vs 融合 v1（整行） vs 融合 v2（分块归约）")
     print("=" * 96)
-    bu.header(f"  {'形状':<15}{'dtype':<9}{'分开':>9}{'融合v1':>9}{'融合v2':>9}"
-              f"{'v1加速':>8}{'v2加速':>8}{'v2带宽':>10}{'利用率':>8}")
+    bu.header(f"  {'形状':<15}{'dtype':<9}{'分开':>9}{'融合v1':>9}{'融合v2':>9}{'融合v3':>9}"
+              f"{'v2加速':>8}{'v3加速':>8}{'v3带宽':>10}{'利用率':>8}")
 
     for shape in BENCH_SHAPES:
         for dtype in BENCH_DTYPES:
@@ -134,6 +134,8 @@ def bench_fusion_gain(device, peak_bw, results):
                             warmup=WARMUP, rep=REP)
             t_v2 = bu.bench(lambda: tk.fused_add_rmsnorm_v2(x, r, w, eps=1e-6),
                             warmup=WARMUP, rep=REP)
+            t_v3 = bu.bench(lambda: tk.fused_add_rmsnorm_v3(x, r, w, eps=1e-6),
+                            warmup=WARMUP, rep=REP)
 
             # 融合版搬运量：读 x + 读 r + 读 w + 写 y + 写 h
             m = 1
@@ -141,15 +143,15 @@ def bench_fusion_gain(device, peak_bw, results):
                 m *= s
             n = shape[-1]
             nb = m * n * x.element_size() * 4 + n * x.element_size()
-            bw = bu.bandwidth_gbps(nb, t_v2["median_ms"])
+            bw = bu.bandwidth_gbps(nb, t_v3["median_ms"])
             util = bw / peak_bw * 100 if peak_bw else None
 
             line = (f"  {str(shape):<15}{str(dtype).split('.')[-1]:<9}"
                     f"{t_un['median_ms']:>9.3f}"
                     f"{t_v1['median_ms']:>9.3f}"
-                    f"{t_v2['median_ms']:>9.3f}"
-                    f"{t_un['median_ms'] / t_v1['median_ms']:>7.2f}x"
+                    f"{t_v2['median_ms']:>9.3f}{t_v3['median_ms']:>9.3f}"
                     f"{t_un['median_ms'] / t_v2['median_ms']:>7.2f}x"
+                    f"{t_un['median_ms'] / t_v3['median_ms']:>7.2f}x"
                     f"{bw:>10.1f}")
             line += f"{util:>7.1f}%" if util else f"{'—':>8}"
             print(line)
@@ -160,11 +162,13 @@ def bench_fusion_gain(device, peak_bw, results):
                 "unfused_ms": t_un["median_ms"],
                 "v1_ms": t_v1["median_ms"],
                 "v2_ms": t_v2["median_ms"],
+                "v3_ms": t_v3["median_ms"],
                 # 兼容旧字段名（v2 为推荐版本）
-                "fused_ms": t_v2["median_ms"],
-                "speedup": t_un["median_ms"] / t_v2["median_ms"],
+                "fused_ms": t_v3["median_ms"],
+                "speedup": t_un["median_ms"] / t_v3["median_ms"],
                 "speedup_v1": t_un["median_ms"] / t_v1["median_ms"],
                 "speedup_v2": t_un["median_ms"] / t_v2["median_ms"],
+                "speedup_v3": t_un["median_ms"] / t_v3["median_ms"],
                 "bandwidth_gbps": bw,
                 "bandwidth_util_pct": util,
             })

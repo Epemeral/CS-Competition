@@ -144,16 +144,26 @@ markdown("""
 
 下面的命令只测 Transformers。`eager` 和 `sdpa` 生成相同 token 后，才能比较吞吐；
 如果两者输出不一致，先停在这里检查版本、dtype 和 attention 实现。
+
+本格先使用小规模冒烟参数，避免第一次运行长时间没有输出。确认冒烟成功后，
+再把参数改大进行正式扫描；结果文件会在每种 attention 完成后立即写入。
 """)
 
 code("""
 import subprocess, sys
+from pathlib import Path
+
 base = [sys.executable, "scripts/qwen25_amdgpu_benchmark.py",
         "--model", MODEL_DIR, "--model-source", "transformers",
-        "--batch-sizes", "1,2,4,8,16,32", "--input-tokens", "512",
-        "--max-new-tokens", "128", "--warmup", "2", "--repeats", "5"]
-subprocess.run(base + ["--attention", "eager", "--output", "results/amdgpu_eager.json"], check=True)
-subprocess.run(base + ["--attention", "sdpa", "--output", "results/amdgpu_sdpa.json"], check=True)
+        # 先验证链路；正式扫描时再逐步扩大这些参数。
+        "--batch-sizes", "1,2,4", "--input-tokens", "256",
+        "--max-new-tokens", "32", "--warmup", "1", "--repeats", "2"]
+for attention, output in (("eager", "results/amdgpu_eager.json"),
+                          ("sdpa", "results/amdgpu_sdpa.json")):
+    print(f"开始 {attention}: batch=1,2,4 input=256 new_tokens=32", flush=True)
+    subprocess.run(base + ["--attention", attention, "--output", output], check=True)
+    path = Path(output)
+    print(f"完成 {attention}: {path} ({path.stat().st_size} bytes)", flush=True)
 """)
 
 markdown("""
@@ -168,8 +178,17 @@ import json
 from pathlib import Path
 
 def show(path):
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    print("\\n", path)
+    path = Path(path)
+    print(f"\\n检查: {path.resolve()}")
+    if not path.exists():
+        print("文件不存在，说明对应的基准测试尚未完成。")
+        return
+    print("文件大小:", path.stat().st_size, "bytes")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print("JSON 尚未写完整:", exc)
+        return
     print("attention:", data["settings"]["attention"], "dtype:", data["settings"]["dtype"])
     for row in data["measurements"]:
         peak = max((x["peak_allocated_bytes"] or 0) for x in row["samples"]) / 1024**3

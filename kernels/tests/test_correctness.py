@@ -254,6 +254,19 @@ def test_qkv_split_rope(rep: Report, device: str):
                           f"v {(v_ref - v_tri).abs().max().item():.2e}")
             rep.check(label, ok, detail)
 
+        # Qwen2.5-7B 的真实 GQA：28 个 Q 头、4 个 KV 头、head_dim=128。
+        B, T, QH, KVH, D = 1, 17, 28, 4, 128
+        qkv = torch.randn(B, T, (QH + 2 * KVH) * D, device=device, dtype=dtype)
+        cos, sin = ref.build_rope_cache(T, D, device=device, dtype=dtype)
+        q_ref, k_ref, v_ref = ref.qkv_split_rope(qkv, cos, sin, QH, D, KVH)
+        q_tri, k_tri, v_tri = tk.qkv_split_rope(qkv, cos, sin, QH, D, KVH)
+        ok = (torch.allclose(q_ref, q_tri, atol=atol, rtol=rtol)
+              and torch.allclose(k_ref, k_tri, atol=atol, rtol=rtol)
+              and torch.allclose(v_ref, v_tri, atol=atol, rtol=rtol))
+        detail = "GQA 输出不一致" if not ok else ""
+        rep.check(f"GQA (B,T,QH,KVH,D)=({B},{T},{QH},{KVH},{D}) "
+                  f"{str(dtype).split('.')[-1]}", ok, detail)
+
 
 # ============================================================
 # 六、极端情况（最容易暴露 bug）

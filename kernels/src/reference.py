@@ -196,6 +196,7 @@ def qkv_split_rope(
     sin: torch.Tensor,
     num_heads: int,
     head_dim: int,
+    num_key_value_heads: int | None = None,
 ):
     """把一次投影出来的 QKV 切开，并对 Q / K 应用 RoPE。
 
@@ -209,21 +210,25 @@ def qkv_split_rope(
         中间张量还要落 HBM 再读出来。融合后只读写一次。
 
     维度契约：
-        qkv : (B, T, 3*H*D)
+        qkv : (B, T, (num_heads + 2*num_key_value_heads)*D)
         cos/sin : (T, D)
-        输出 : (q, k, v)，各 (B, T, H*D)
+        输出 : q=(B,T,num_heads*D)，k/v=(B,T,num_key_value_heads*D)
     """
+    if num_key_value_heads is None:
+        num_key_value_heads = num_heads
     B, T, three_hd = qkv.shape
-    HD = num_heads * head_dim
-    assert three_hd == 3 * HD, f"qkv 最后一维应为 3*H*D={3*HD}，实际 {three_hd}"
+    q_hd = num_heads * head_dim
+    kv_hd = num_key_value_heads * head_dim
+    expected = q_hd + 2 * kv_hd
+    assert three_hd == expected, f"qkv 最后一维应为 {expected}，实际 {three_hd}"
 
-    q, k, v = qkv.split([HD, HD, HD], dim=-1)
+    q, k, v = qkv.split([q_hd, kv_hd, kv_hd], dim=-1)
 
     def rot(x):
         # (B, T, H*D) -> (B, H, T, D) -> rope -> 回到 (B, T, H*D)
-        xr = x.view(B, T, num_heads, head_dim).transpose(1, 2)
+        xr = x.view(B, T, x.shape[-1] // head_dim, head_dim).transpose(1, 2)
         out = rope(xr, cos, sin)
-        return out.transpose(1, 2).reshape(B, T, HD)
+        return out.transpose(1, 2).reshape(B, T, -1)
 
     return rot(q), rot(k), v
 

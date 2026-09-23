@@ -28,6 +28,15 @@ import triton.language as tl
 # ============================================================
 # 一、RMSNorm
 # ============================================================
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1),
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+    ],
+    key=["N"],
+)
 @triton.jit
 def _rmsnorm_fwd_kernel(
     X, W, Y,
@@ -560,13 +569,14 @@ def rope(q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
 @triton.jit
 def _qkv_rope_kernel(
     QKV, COS, SIN, Q_OUT, K_OUT, V_OUT,
-    T, H,
+    T, Q_HEADS, KV_HEADS,
+    Q_HD, KV_HD,
     D: tl.constexpr,
-    HD: tl.constexpr,
 ):
     """融合：切分 QKV + 对 Q/K 应用 RoPE + 写出。
 
-    grid = (B, T, H)，每个 program 处理一个 head 的 D 维向量。
+    grid = (B, T, Q_HEADS)，每个 program 处理一个 Q head；
+    当 Q_HEADS > KV_HEADS 时，只有前 KV_HEADS 个 program 写 K/V。
     """
     pid_b = tl.program_id(0)
     pid_t = tl.program_id(1)
@@ -574,12 +584,13 @@ def _qkv_rope_kernel(
 
     half = tl.arange(0, D // 2)
 
-    # qkv 里这一行的基址：(B, T, 3*HD)
-    row_base = pid_b * (T * 3 * HD) + pid_t * (3 * HD)
+    # qkv 里这一行的基址：(B, T, Q_HD + 2*KV_HD)
+    row_stride = Q_HD + 2 * KV_HD
+    row_base = pid_b * (T * row_stride) + pid_t * row_stride
     h_off = pid_h * D
 
     # 输出基址：q/k/v 各自是 (B, T, HD)
-    out_base = pid_b * (T * HD) + pid_t * HD + h_off
+    q_out_base = pid_b * (T * Q_HD) + pid_t * Q_HD + h_off
 
     # cos/sin（同一位置 t，所有 head 共用）
     c = tl.load(COS + pid_t * D + half).to(tl.float32)
@@ -589,26 +600,29 @@ def _qkv_rope_kernel(
     q_base = row_base + h_off
     q1 = tl.load(QKV + q_base + half).to(tl.float32)
     q2 = tl.load(QKV + q_base + half + D // 2).to(tl.float32)
-    tl.store(Q_OUT + out_base + half,
+    tl.store(Q_OUT + q_out_base + half,
              (q1 * c - q2 * s).to(Q_OUT.dtype.element_ty))
-    tl.store(Q_OUT + out_base + half + D // 2,
+    tl.store(Q_OUT + q_out_base + half + D // 2,
              (q2 * c + q1 * s).to(Q_OUT.dtype.element_ty))
 
     # ---- K：旋转 ----
-    k_base = row_base + HD + h_off
-    k1 = tl.load(QKV + k_base + half).to(tl.float32)
-    k2 = tl.load(QKV + k_base + half + D // 2).to(tl.float32)
-    tl.store(K_OUT + out_base + half,
-             (k1 * c - k2 * s).to(K_OUT.dtype.element_ty))
-    tl.store(K_OUT + out_base + half + D // 2,
-             (k2 * c + k1 * s).to(K_OUT.dtype.element_ty))
+    kv_valid = pid_h < KV_HEADS
+    kv_off = pid_h * D
+    k_base = row_base + Q_HD + kv_off
+    k1 = tl.load(QKV + k_base + half, mask=kv_valid, other=0.0).to(tl.float32)
+    k2 = tl.load(QKV + k_base + half + D // 2, mask=kv_valid, other=0.0).to(tl.float32)
+    k_out_base = pid_b * (T * KV_HD) + pid_t * KV_HD + kv_off
+    tl.store(K_OUT + k_out_base + half,
+             (k1 * c - k2 * s).to(K_OUT.dtype.element_ty), mask=kv_valid)
+    tl.store(K_OUT + k_out_base + half + D // 2,
+             (k2 * c + k1 * s).to(K_OUT.dtype.element_ty), mask=kv_valid)
 
     # ---- V：不旋转，原样搬运 ----
-    v_base = row_base + 2 * HD + h_off
-    v1 = tl.load(QKV + v_base + half)
-    v2 = tl.load(QKV + v_base + half + D // 2)
-    tl.store(V_OUT + out_base + half, v1)
-    tl.store(V_OUT + out_base + half + D // 2, v2)
+    v_base = row_base + Q_HD + KV_HD + kv_off
+    v1 = tl.load(QKV + v_base + half, mask=kv_valid, other=0.0)
+    v2 = tl.load(QKV + v_base + half + D // 2, mask=kv_valid, other=0.0)
+    tl.store(V_OUT + k_out_base + half, v1, mask=kv_valid)
+    tl.store(V_OUT + k_out_base + half + D // 2, v2, mask=kv_valid)
 
 
 def qkv_split_rope(
@@ -617,22 +631,29 @@ def qkv_split_rope(
     sin: torch.Tensor,
     num_heads: int,
     head_dim: int,
+    num_key_value_heads: int | None = None,
 ):
-    """Triton 版 QKV 切分 + RoPE。qkv: (B, T, 3*H*D)，返回 (q, k, v)。"""
+    """Triton 版 QKV 切分 + RoPE，支持 MHA 和 GQA。"""
     assert qkv.is_cuda, "Triton kernel 需要 CUDA/ROCm 设备"
     qkv = qkv.contiguous()
     B, T, three_hd = qkv.shape
-    HD = num_heads * head_dim
+    if num_key_value_heads is None:
+        num_key_value_heads = num_heads
+    q_hd = num_heads * head_dim
+    kv_hd = num_key_value_heads * head_dim
+    expected = q_hd + 2 * kv_hd
+    assert three_hd == expected, f"qkv 最后一维应为 {expected}，实际 {three_hd}"
 
-    q = torch.empty((B, T, HD), device=qkv.device, dtype=qkv.dtype)
-    k = torch.empty_like(q)
-    v = torch.empty_like(q)
+    q = torch.empty((B, T, q_hd), device=qkv.device, dtype=qkv.dtype)
+    k = torch.empty((B, T, kv_hd), device=qkv.device, dtype=qkv.dtype)
+    v = torch.empty_like(k)
 
     grid = (B, T, num_heads)
     _qkv_rope_kernel[grid](
         qkv, cos, sin, q, k, v,
-        T, num_heads,
-        D=head_dim, HD=HD,
+        T, num_heads, num_key_value_heads,
+        q_hd, kv_hd,
+        D=head_dim,
     )
     return q, k, v
 

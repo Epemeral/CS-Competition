@@ -18,6 +18,8 @@ python -m venv --system-site-packages .venv
 - `baseline.py`：准备版 PyTorch/Transformers 推理与测量入口。
 - `evaluate.py`：token 级正确性比较。
 - `t1/core.py`：与模型无关的校验逻辑。
+- `kernels/`：T4 阶段的 Triton 融合算子工作台（参考实现 → kernel → 正确性验证 → 性能基准）。
+  独立于 T1，可在 Colab / DCU 集群上单独运行，详见 `kernels/README.md`。
 - `docs/T1学习指南.md`：概念和本地练习。
 - `docs/T1代码解构.md`：执行链路和代码说明。
 - `docs/后续步骤.md`：DCU 账号到位后的路线。

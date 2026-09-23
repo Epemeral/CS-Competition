@@ -7,7 +7,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from t1.core import digest, read_cases, trim_generated
+from t1.core import digest, make_batch_indices, padding_stats, read_cases, trim_generated
 
 
 def positive(value):
@@ -34,6 +34,8 @@ def main():
     parser.add_argument("--warmup", type=positive, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--length-bucket", action="store_true",
+                        help="Sort cases by token length inside batches to reduce padding")
     args = parser.parse_args()
     target = Path(args.output)
     if target.exists():
@@ -87,30 +89,34 @@ def main():
     generation = GenerationConfig(do_sample=False, num_beams=1, max_new_tokens=args.max_new_tokens,
                                   eos_token_id=eos, pad_token_id=pad, use_cache=not args.no_cache)
 
+    lengths = list(map(len, inputs))
+    batch_plan = make_batch_indices(lengths, args.batch_size, args.length_bucket)
     batches = []
-    for start in range(0, len(inputs), args.batch_size):
-        rows = inputs[start:start + args.batch_size]
+    for indices in batch_plan:
+        rows = [inputs[index] for index in indices]
         width = max(map(len, rows))
         # Decoder-only generation needs left padding and an explicit attention mask.
         ids = torch.tensor([[pad] * (width - len(row)) + row for row in rows], device=args.device)
         mask = torch.tensor([[0] * (width - len(row)) + [1] * len(row) for row in rows], device=args.device)
-        batches.append((ids, mask))
+        batches.append((ids, mask, indices))
+    padding = padding_stats(lengths, batch_plan)
 
     def synchronize():
         if args.device == "cuda":
             torch.cuda.synchronize()
 
     def run():
-        raw = []
+        generated = [None] * len(inputs)
         synchronize()
         started = time.perf_counter()
         with torch.inference_mode():
-            for ids, mask in batches:
+            for ids, mask, indices in batches:
                 output = model.generate(input_ids=ids, attention_mask=mask, generation_config=generation)
-                raw.append(output[:, ids.shape[1]:])
+                rows = output[:, ids.shape[1]:].cpu().tolist()
+                for index, row in zip(indices, rows):
+                    generated[index] = trim_generated(row, eos)
         synchronize()
         elapsed = time.perf_counter() - started
-        generated = [trim_generated(row, eos) for batch in raw for row in batch.cpu().tolist()]
         return elapsed, generated
 
     for _ in range(args.warmup):
@@ -127,6 +133,9 @@ def main():
         measurements.append({"seconds": elapsed, "output_tokens": count,
                              "output_tokens_per_second": count / elapsed,
                              "requests_per_second": len(cases) / elapsed,
+                             "input_tokens": padding["input_tokens"],
+                             "padded_input_tokens": padding["padded_input_tokens"],
+                             "padding_waste_ratio": padding["padding_waste_ratio"],
                              "peak_allocated_bytes": torch.cuda.max_memory_allocated() if args.device == "cuda" else None})
     try:
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -148,7 +157,9 @@ def main():
                         "device": torch.cuda.get_device_name() if args.device == "cuda" else platform.processor(),
                         "git_commit": commit, "git_dirty": dirty},
         "measurement_scope": "Pre-tokenized resident inputs; synchronized generate over static batches; excludes load/tokenize/decode; includes generated EOS",
-        "input_tokens": sum(map(len, inputs)), "runs": measurements,
+        "batching": {"strategy": "length_sorted" if args.length_bucket else "input_order",
+                     "batch_size": args.batch_size, "batch_count": len(batch_plan), **padding},
+        "input_tokens": padding["input_tokens"], "runs": measurements,
         "median_output_tokens_per_second": statistics.median(row["output_tokens_per_second"] for row in measurements),
         "outputs": outputs,
     }

@@ -29,6 +29,34 @@ def trim_generated(tokens, eos_ids):
     return tokens
 
 
+def make_batch_indices(lengths, batch_size, sort_by_length=False):
+    """Return batch index groups without changing the caller's case order."""
+    if not lengths:
+        raise ValueError("At least one input length is required")
+    if batch_size < 1:
+        raise ValueError("Batch size must be positive")
+    if any(length < 1 for length in lengths):
+        raise ValueError("Input lengths must be positive")
+    order = list(range(len(lengths)))
+    if sort_by_length:
+        # Stable sorting keeps equal-length cases deterministic.
+        order.sort(key=lambda index: (lengths[index], index))
+    return [order[start:start + batch_size] for start in range(0, len(order), batch_size)]
+
+
+def padding_stats(lengths, batches):
+    """Summarize useful and padded input tokens for a static batch plan."""
+    actual = sum(lengths)
+    padded = sum(max(lengths[index] for index in batch) * len(batch) for batch in batches)
+    padding = padded - actual
+    return {
+        "input_tokens": actual,
+        "padded_input_tokens": padded,
+        "padding_tokens": padding,
+        "padding_waste_ratio": padding / padded if padded else 0.0,
+    }
+
+
 def compare(reference, candidate):
     if reference["contract"] != candidate["contract"]:
         raise ValueError("Incompatible model/input/generation contract")

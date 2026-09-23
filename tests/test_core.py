@@ -3,7 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from t1.core import compare, read_cases, trim_generated
+from t1.core import (compare, make_batch_indices, padding_stats, read_cases,
+                     trim_generated)
 
 
 class CorrectnessTests(unittest.TestCase):
@@ -46,6 +47,29 @@ class CorrectnessTests(unittest.TestCase):
             path.write_text('{"id":"a","prompt":"x"}\n' * 2, encoding="utf-8")
             with self.assertRaises(ValueError):
                 read_cases(path)
+
+    def test_length_sorted_batches_reduce_padding_without_reordering_cases(self):
+        lengths = [8, 2, 7, 3]
+        batches = make_batch_indices(lengths, 2, sort_by_length=True)
+        input_order_stats = padding_stats(lengths, make_batch_indices(lengths, 2))
+        self.assertEqual(batches, [[1, 3], [2, 0]])
+        self.assertEqual(sorted(index for batch in batches for index in batch), list(range(4)))
+        sorted_stats = padding_stats(lengths, batches)
+        self.assertLess(sorted_stats["padded_input_tokens"], input_order_stats["padded_input_tokens"])
+        self.assertEqual(sorted_stats, {
+            "input_tokens": 20,
+            "padded_input_tokens": 22,
+            "padding_tokens": 2,
+            "padding_waste_ratio": 2 / 22,
+        })
+
+    def test_padding_stats_for_input_order_batches(self):
+        lengths = [8, 2, 7, 3]
+        batches = make_batch_indices(lengths, 2)
+        stats = padding_stats(lengths, batches)
+        self.assertEqual(stats["padded_input_tokens"], 30)
+        self.assertEqual(stats["padding_tokens"], 10)
+        self.assertAlmostEqual(stats["padding_waste_ratio"], 1 / 3)
 
 
 if __name__ == "__main__":

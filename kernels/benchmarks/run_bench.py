@@ -4,7 +4,7 @@
 
 【这个脚本产出什么】
     1. 控制台表格：每个 kernel 的 PyTorch vs Triton 耗时、加速比、带宽利用率
-    2. results/*.json：机器可读的原始数据（写报告、画图都用它）
+    2. ../../results/t4/*.json：机器可读的原始数据（写报告、画图都用它）
     3. 融合收益对比：证明「融合」到底省了多少
 
 【怎么用这些数据】
@@ -32,7 +32,8 @@ import bench_utils as bu        # noqa: E402
 import reference as ref         # noqa: E402
 import triton_kernels as tk     # noqa: E402
 
-RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
+# Keep benchmark artifacts beside T1/T2 results at repository root.
+RESULTS_DIR = Path(__file__).resolve().parents[2] / "results" / "t4"
 
 
 # ============================================================

@@ -173,7 +173,7 @@ def main():
     # ---- 落盘 ----
     import json
     import time
-    out_dir = Path(__file__).resolve().parent.parent / "results"
+    out_dir = Path(__file__).resolve().parents[2] / "results" / "t4"
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"component_share_{time.strftime('%Y%m%d_%H%M%S')}.json"
     out.write_text(json.dumps({

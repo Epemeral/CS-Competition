@@ -37,7 +37,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "integration"))
 
-RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
+RESULTS_DIR = Path(__file__).resolve().parents[2] / "results" / "t4"
 
 # T4（14.6 GiB）能跑 1.5B；7B 需要 DCU 的 64 GiB
 DEFAULT_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"

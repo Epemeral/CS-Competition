@@ -27,7 +27,7 @@ md("""
 
 1. 运行环境检查；没有 GPU 时仍可运行 CPU 参考检查。
 2. 运行正确性脚本；通过后再测性能。
-3. 运行单算子基准，并保存 `kernels/results/` 下的 JSON。
+3. 运行单算子基准，并保存仓库根目录 `results/t4/` 下的 JSON。
 4. 需要接入 vLLM 时，先在独立环境执行 integration patch，再做端到端 token 对齐。
 """)
 
@@ -216,7 +216,8 @@ else:
 code("""
 from pathlib import Path
 import json
-result_files = sorted((KERNELS/'results').glob('bench_*.json'))
+result_dir = KERNELS.parent / 'results' / 't4'
+result_files = sorted(result_dir.glob('bench_*.json'))
 if result_files:
     latest = result_files[-1]
     data = json.loads(latest.read_text(encoding='utf-8'))

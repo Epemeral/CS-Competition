@@ -52,19 +52,44 @@ print('Platform:', platform.platform())
 code("""
 from pathlib import Path
 import sys
+import subprocess
 
 ROOT = Path.cwd()
-if (ROOT / 'kernels').exists():
-    KERNELS = ROOT / 'kernels'
-elif ROOT.name == 'notebooks' and (ROOT.parent / 'src').exists():
-    KERNELS = ROOT.parent
-elif (ROOT / 'src').exists() and (ROOT / 'tests').exists():
-    KERNELS = ROOT
-else:
-    KERNELS = Path('/content/cs-comp/kernels')
+def is_kernel_tree(path):
+    return (path / 'src' / 'reference.py').is_file() and \\
+           (path / 'tests' / 'test_correctness.py').is_file()
+
+candidates = [
+    ROOT / 'kernels',
+    ROOT,
+    Path('/content/cs-comp/kernels'),
+    Path('/content/CS-Competition/kernels'),
+]
+KERNELS = next((p for p in candidates if is_kernel_tree(p)), None)
+
+if KERNELS is None:
+    target = Path('/content/cs-comp')
+    repo = 'https://github.com/Epemeral/CS-Competition.git'
+    print('未发现完整 kernels 源码，尝试下载 feat/t4-triton-kernels ...')
+    try:
+        subprocess.run(['git', 'clone', '-b', 'feat/t4-triton-kernels',
+                        '--depth', '1', repo, str(target)], check=True)
+    except Exception as exc:
+        raise RuntimeError(
+            '无法自动获取仓库。请将仓库中的 kernels 文件夹上传到 '
+            '/content/cs-comp/kernels 后，重新运行本单元。原始错误: ' + repr(exc)
+        ) from exc
+    KERNELS = target / 'kernels'
+
+if not is_kernel_tree(KERNELS):
+    raise FileNotFoundError(
+        f'找到的路径不完整: {KERNELS}。需要 src/reference.py 和 tests/test_correctness.py。'
+    )
 SRC = KERNELS / 'src'
-sys.path.insert(0, str(SRC))
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 print('KERNELS =', KERNELS)
+print('reference.py =', SRC / 'reference.py')
 """)
 
 md("""

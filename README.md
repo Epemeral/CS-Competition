@@ -28,6 +28,7 @@ python -m venv --system-site-packages .venv
 - `docs/T1学习指南.md`：概念和本地练习。
 - `docs/T1代码解构.md`：执行链路和代码说明。
 - `docs/T1优化分析.md`：T1 可验证优化、实验矩阵和 T1/T2/T3/T4 边界。
+- `docs/T4实施计划.md`：T4 算子、融合、vLLM 接入和 DCU 验收路线。
 - `docs/后续步骤.md`：DCU 账号到位后的路线。
 - `docs/方式三AMDGPU Notebook指南.md`：方式三环境的安装、基线和优化顺序。
 - `docs/数据集接入计划.md`：五个外部数据集的用途、优先级和 Notebook 接入顺序。

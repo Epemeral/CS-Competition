@@ -78,16 +78,41 @@ code("""
 """)
 
 code("""
-# 拉取当前实验分支。重跑时保留已有目录，避免重复下载。
-import os
+# 节点可能无法访问 GitHub。优先使用已有目录；否则可上传仓库 zip 到 Notebook。
+import os, shutil, subprocess, zipfile
 REPO = "https://github.com/Epemeral/CS-Competition.git"
 BRANCH = "feat/t4-triton-kernels"
 WORKDIR = "/mnt/data/CS-Competition"
+ARCHIVE = os.environ.get("REPO_ARCHIVE", "/mnt/data/CS-Competition.zip")
 if not os.path.exists(os.path.join(WORKDIR, ".git")):
-    !git clone --depth 1 --branch {BRANCH} {REPO} {WORKDIR}
+    if os.path.exists(ARCHIVE):
+        print("使用上传的仓库压缩包:", ARCHIVE)
+        EXTRACT_DIR = "/mnt/data/.cs_competition_extract"
+        shutil.rmtree(EXTRACT_DIR, ignore_errors=True)
+        os.makedirs(EXTRACT_DIR, exist_ok=True)
+        with zipfile.ZipFile(ARCHIVE) as archive:
+            archive.extractall(EXTRACT_DIR)
+        # 同时支持 git archive 的根目录文件和 GitHub 下载的一层目录。
+        candidates = [EXTRACT_DIR, os.path.join(EXTRACT_DIR, "CS-Competition-main")]
+        source = next((item for item in candidates if os.path.exists(os.path.join(item, "scripts"))), None)
+        if source:
+            shutil.rmtree(WORKDIR, ignore_errors=True)
+            shutil.move(source, WORKDIR)
+        if not os.path.exists(os.path.join(WORKDIR, "scripts")):
+            raise FileNotFoundError("压缩包中没有找到 CS-Competition/scripts")
+    else:
+        try:
+            subprocess.run(["git", "clone", "--depth", "1", "--branch", BRANCH, REPO, WORKDIR], check=True, timeout=45)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(
+                "无法访问 GitHub。请在本地执行 git archive 导出 zip，上传为 /mnt/data/CS-Competition.zip 后重跑本格。"
+            ) from exc
 else:
-    # 仓库已存在时只做快进更新，不覆盖 Notebook 中未提交的本地修改。
-    !git -C {WORKDIR} pull --ff-only origin {BRANCH}
+    # 仓库已存在时尝试快进更新；网络受限时保留当前已上传版本继续运行。
+    try:
+        subprocess.run(["git", "-C", WORKDIR, "pull", "--ff-only", "origin", BRANCH], check=True, timeout=45)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        print("GitHub 同步失败，继续使用当前 WORKDIR 版本")
 %cd /mnt/data/CS-Competition
 !git log -1 --oneline
 """)

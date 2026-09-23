@@ -58,6 +58,28 @@ Notebook 的仓库单元第一次运行时会 clone；以后再次运行会执�
 
 更新代码后，重新运行导入、模型加载和基准测试单元。旧的变量和旧模型可能仍在内存中，比较新旧方案前建议选择 **Kernel -> Restart Kernel**，再从头运行。
 
+## GitHub 超时：使用上传的 zip
+
+如果 Notebook 节点只能访问国内网络，不要在节点上反复重试 GitHub。先在能访问 GitHub 的电脑上导出目标分支：
+
+```powershell
+cd E:\DCU\CS-Competition
+git switch feat/t4-triton-kernels
+git pull --ff-only origin feat/t4-triton-kernels
+git archive --format=zip --output=CS-Competition.zip HEAD
+```
+
+在 Notebook 网站的文件面板上传 `CS-Competition.zip` 到 `/mnt/data/`，然后重新运行仓库同步单元。它会自动解压并使用上传版本，不需要访问 GitHub。
+
+也可以设置自定义路径：
+
+```python
+import os
+os.environ["REPO_ARCHIVE"] = "/mnt/data/uploads/CS-Competition.zip"
+```
+
+压缩包必须包含 `scripts/`、`notebooks/` 等仓库目录。每次本地代码更新后重新执行 `git archive`，再上传覆盖旧 zip。
+
 ## 只想临时改一格
 
 在 JupyterLab 中打开 `notebooks/amdgpu_qwen25_7b.ipynb`，点击 **Insert** 添加 Markdown 或 Code 单元，执行并确认结果即可。临时修改不会自动回写生成脚本；要保留它，应把同样内容复制到 `scripts/build_amdgpu_notebook.py`，重新生成并提交。

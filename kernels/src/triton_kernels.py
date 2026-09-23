@@ -316,6 +316,68 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# ---- vLLM 风格接口：单张量输入 (..., 2H) ----
+# vLLM 的 MLP 是「一次矩阵乘算出 2H，再切开做激活」，
+# 所以需要一个接受 (..., 2H) 的版本才能接进去。
+# 这是「适配层」—— 功能等价，但接口对齐了 vLLM 的 SiluAndMul。
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK": 256}, num_warps=2),
+        triton.Config({"BLOCK": 512}, num_warps=4),
+        triton.Config({"BLOCK": 1024}, num_warps=4),
+        triton.Config({"BLOCK": 2048}, num_warps=8),
+        triton.Config({"BLOCK": 4096}, num_warps=8),
+    ],
+    key=["n_out"],
+)
+@triton.jit
+def _silu_and_mul_kernel(
+    X, OUT,
+    n_out,                  # 输出元素总数 = B*T*H
+    H,                      # intermediate_size（每行 gate 的宽度）
+    BLOCK: tl.constexpr,
+):
+    """输入 (..., 2H) → 输出 (..., H)。
+
+    索引换算：
+        offs 是「输出」的扁平索引
+        row  = offs // H        第几行
+        col  = offs % H         行内第几个
+        gate = X[row * 2H + col]
+        up   = X[row * 2H + H + col]
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_out
+
+    row = offs // H
+    col = offs - row * H            # 用减法代替取模，省一次除法
+
+    gate_idx = row * (2 * H) + col
+    up_idx = gate_idx + H
+
+    g = tl.load(X + gate_idx, mask=mask, other=0.0).to(tl.float32)
+    u = tl.load(X + up_idx, mask=mask, other=0.0).to(tl.float32)
+
+    out = (g * tl.sigmoid(g)) * u
+    tl.store(OUT + offs, out.to(OUT.dtype.element_ty), mask=mask)
+
+
+def silu_and_mul_triton(x: torch.Tensor) -> torch.Tensor:
+    """vLLM 风格的 SiLU+Mul 融合。输入 (..., 2H) → 输出 (..., H)。"""
+    assert x.is_cuda, "Triton kernel 需要 CUDA/ROCm 设备"
+    x = x.contiguous()
+    H = x.shape[-1] // 2
+    out = torch.empty(list(x.shape[:-1]) + [H], device=x.device, dtype=x.dtype)
+
+    n_out = out.numel()
+    grid = lambda meta: (triton.cdiv(n_out, meta["BLOCK"]),)
+
+    _silu_and_mul_kernel[grid](x, out, n_out, H)
+    return out
+
+
 # ============================================================
 # 四、RMSNorm v2：分块归约版（解决大 N 的寄存器爆炸）
 # ============================================================

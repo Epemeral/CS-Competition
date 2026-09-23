@@ -83,6 +83,24 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     return F.silu(gate) * up
 
 
+def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    """vLLM 的 SiluAndMul 风格：输入是「gate 和 up 拼在一起」的单张量。
+
+    维度契约：
+        x    : (..., 2*H)     前半是 gate，后半是 up
+        输出  : (..., H)
+
+    为什么需要这个接口：
+        vLLM 的 MLP 先用一次矩阵乘算出 (..., 2H)，再调 SiluAndMul 切开做激活。
+        我们的 swiglu() 是「两个张量」接口，接不进去 —— 所以要写一个 vLLM 风格的适配版。
+
+    ⚠️ 这是「适配层」，不是「性能优化」：真正的收益来自把它换成 Triton kernel
+       （见 triton_kernels.silu_and_mul_triton）。
+    """
+    H = x.shape[-1] // 2
+    return swiglu(x[..., :H], x[..., H:])
+
+
 def swiglu_mlp(
     x: torch.Tensor,
     w_gate: torch.Tensor,

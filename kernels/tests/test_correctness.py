@@ -96,26 +96,33 @@ def max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
 # 一、RMSNorm
 # ============================================================
 def test_rmsnorm(rep: Report, device: str):
-    print("\n【RMSNorm】")
+    print("\n【RMSNorm】v1=整行处理 / v2=分块归约")
     for shape in SHAPES:
         for dtype, atol, rtol in DTYPES:
             x = torch.randn(*shape, device=device, dtype=dtype)
             w = torch.randn(shape[-1], device=device, dtype=dtype)
 
             y_ref = ref.rmsnorm(x, w, eps=1e-6)
-            y_tri = tk.rmsnorm(x, w, eps=1e-6)
+            y_v1 = tk.rmsnorm(x, w, eps=1e-6)
+            y_v2 = tk.rmsnorm_v2(x, w, eps=1e-6)
 
-            ok = torch.allclose(y_ref, y_tri, atol=atol, rtol=rtol)
-            diff = max_abs_diff(y_ref, y_tri)
+            ok1 = torch.allclose(y_ref, y_v1, atol=atol, rtol=rtol)
+            ok2 = torch.allclose(y_ref, y_v2, atol=atol, rtol=rtol)
+
             label = f"{str(shape):>14}  {str(dtype).split('.')[-1]:<16}"
-            rep.check(label, ok, f"最大误差 {diff:.2e}" if not ok else "")
+            detail = ""
+            if not ok1:
+                detail += f"v1 误差 {max_abs_diff(y_ref, y_v1):.2e} "
+            if not ok2:
+                detail += f"v2 误差 {max_abs_diff(y_ref, y_v2):.2e}"
+            rep.check(label, ok1 and ok2, detail)
 
 
 # ============================================================
 # 二、融合 Add + RMSNorm
 # ============================================================
 def test_fused_add_rmsnorm(rep: Report, device: str):
-    print("\n【融合 Add + RMSNorm】")
+    print("\n【融合 Add + RMSNorm】v1=整行处理 / v2=分块归约")
     for shape in SHAPES:
         for dtype, atol, rtol in DTYPES:
             x = torch.randn(*shape, device=device, dtype=dtype)
@@ -123,18 +130,23 @@ def test_fused_add_rmsnorm(rep: Report, device: str):
             w = torch.randn(shape[-1], device=device, dtype=dtype)
 
             y_ref, h_ref = ref.fused_add_rmsnorm(x, r, w, eps=1e-6)
-            y_tri, h_tri = tk.fused_add_rmsnorm(x, r, w, eps=1e-6)
+            y_v1, h_v1 = tk.fused_add_rmsnorm(x, r, w, eps=1e-6)
+            y_v2, h_v2 = tk.fused_add_rmsnorm_v2(x, r, w, eps=1e-6)
 
-            ok_y = torch.allclose(y_ref, y_tri, atol=atol, rtol=rtol)
-            ok_h = torch.allclose(h_ref, h_tri, atol=atol, rtol=rtol)
+            ok1 = (torch.allclose(y_ref, y_v1, atol=atol, rtol=rtol)
+                   and torch.allclose(h_ref, h_v1, atol=atol, rtol=rtol))
+            ok2 = (torch.allclose(y_ref, y_v2, atol=atol, rtol=rtol)
+                   and torch.allclose(h_ref, h_v2, atol=atol, rtol=rtol))
 
             label = f"{str(shape):>14}  {str(dtype).split('.')[-1]:<16}"
             detail = ""
-            if not ok_y:
-                detail += f"y 误差 {max_abs_diff(y_ref, y_tri):.2e} "
-            if not ok_h:
-                detail += f"h 误差 {max_abs_diff(h_ref, h_tri):.2e}"
-            rep.check(label, ok_y and ok_h, detail)
+            if not ok1:
+                detail += (f"v1 y误差 {max_abs_diff(y_ref, y_v1):.2e} "
+                           f"h误差 {max_abs_diff(h_ref, h_v1):.2e} ")
+            if not ok2:
+                detail += (f"v2 y误差 {max_abs_diff(y_ref, y_v2):.2e} "
+                           f"h误差 {max_abs_diff(h_ref, h_v2):.2e}")
+            rep.check(label, ok1 and ok2, detail)
 
 
 # ============================================================
@@ -157,7 +169,94 @@ def test_swiglu(rep: Report, device: str):
 
 
 # ============================================================
-# 四、极端情况（最容易暴露 bug）
+# 四、RoPE
+# ============================================================
+def test_rope(rep: Report, device: str):
+    print("\n【RoPE 旋转位置编码】")
+    # (B, H, T, D) 组合，最后一个对应 Qwen2.5-7B 的 head_dim=128
+    cases = [
+        (1, 1, 4, 8),
+        (2, 4, 8, 16),
+        (1, 8, 32, 64),
+        (2, 4, 16, 128),
+    ]
+    for dtype, atol, rtol in DTYPES:
+        for (B, H, T, D) in cases:
+            q = torch.randn(B, H, T, D, device=device, dtype=dtype)
+            cos, sin = ref.build_rope_cache(T, D, device=device, dtype=dtype)
+
+            y_ref = ref.rope(q, cos, sin)
+            y_tri = tk.rope(q, cos, sin)
+
+            ok = torch.allclose(y_ref, y_tri, atol=atol, rtol=rtol)
+            label = f"{str((B, H, T, D)):>20}  {str(dtype).split('.')[-1]:<16}"
+            detail = ""
+            if not ok:
+                detail = f"最大误差 {max_abs_diff(y_ref, y_tri):.2e}"
+            rep.check(label, ok, detail)
+
+
+def test_rope_property(rep: Report, device: str):
+    """验证 RoPE 的数学性质（不只是数值对齐）。"""
+    print("\n【RoPE 性质检查】")
+
+    B, H, T, D = 2, 4, 16, 64
+    q = torch.randn(B, H, T, D, device=device, dtype=torch.float32)
+    cos, sin = ref.build_rope_cache(T, D, device=device, dtype=torch.float32)
+    y = ref.rope(q, cos, sin)
+
+    # 性质 1：旋转是正交变换，不改变向量模长
+    n_before = q.norm(dim=-1)
+    n_after = y.norm(dim=-1)
+    rep.check("旋转不改变向量模长（正交变换）",
+              torch.allclose(n_before, n_after, atol=1e-3),
+              f"最大模长差 {(n_before - n_after).abs().max().item():.2e}")
+
+    # 性质 2：位置 0 的 cos=1, sin=0，所以不应该改变向量
+    cos0, sin0 = ref.build_rope_cache(1, D, device=device, dtype=torch.float32)
+    q0 = torch.randn(B, H, 1, D, device=device, dtype=torch.float32)
+    y0 = ref.rope(q0, cos0, sin0)
+    rep.check("位置 0 不改变向量（cos=1, sin=0）",
+              torch.allclose(q0, y0, atol=1e-5),
+              f"最大误差 {(q0 - y0).abs().max().item():.2e}")
+
+
+# ============================================================
+# 五、QKV 切分 + RoPE 融合
+# ============================================================
+def test_qkv_split_rope(rep: Report, device: str):
+    print("\n【QKV 切分 + RoPE 融合】")
+    # (B, T, H, D)，最后一个是 Qwen2.5-7B 的 28 头 × 128 维
+    cases = [
+        (1, 8, 2, 16),
+        (2, 16, 4, 32),
+        (1, 32, 8, 64),
+        (1, 16, 28, 128),
+    ]
+    for dtype, atol, rtol in DTYPES:
+        for (B, T, H, D) in cases:
+            HD = H * D
+            qkv = torch.randn(B, T, 3 * HD, device=device, dtype=dtype)
+            cos, sin = ref.build_rope_cache(T, D, device=device, dtype=dtype)
+
+            q_ref, k_ref, v_ref = ref.qkv_split_rope(qkv, cos, sin, H, D)
+            q_tri, k_tri, v_tri = tk.qkv_split_rope(qkv, cos, sin, H, D)
+
+            ok = (torch.allclose(q_ref, q_tri, atol=atol, rtol=rtol)
+                  and torch.allclose(k_ref, k_tri, atol=atol, rtol=rtol)
+                  and torch.allclose(v_ref, v_tri, atol=atol, rtol=rtol))
+
+            label = f"{str((B, T, H, D)):>20}  {str(dtype).split('.')[-1]:<16}"
+            detail = ""
+            if not ok:
+                detail = (f"q {(q_ref - q_tri).abs().max().item():.2e} "
+                          f"k {(k_ref - k_tri).abs().max().item():.2e} "
+                          f"v {(v_ref - v_tri).abs().max().item():.2e}")
+            rep.check(label, ok, detail)
+
+
+# ============================================================
+# 六、极端情况（最容易暴露 bug）
 # ============================================================
 def test_edge_cases(rep: Report, device: str):
     print("\n【极端情况】")
@@ -207,6 +306,29 @@ def test_edge_cases(rep: Report, device: str):
               torch.allclose(out, out_ref, atol=1e-4),
               f"最大误差 {max_abs_diff(out, out_ref):.2e}")
 
+    # 6. 分块归约的阈值边界（block_cap=4096）——
+    #    N 在阈值两侧会走不同的代码路径，都要正确
+    for n in (4095, 4096, 4097, 8192):
+        x = torch.randn(2, n, device=device)
+        w = torch.randn(n, device=device)
+        y = tk.rmsnorm_v2(x, w, eps=1e-6)
+        y_ref = ref.rmsnorm(x, w, eps=1e-6)
+        rep.check(f"分块阈值边界 N={n}（{'单遍' if n <= 4096 else '分块'}路径）",
+                  torch.allclose(y, y_ref, atol=1e-4),
+                  f"最大误差 {max_abs_diff(y, y_ref):.2e}")
+
+    # 7. 融合版的分块阈值边界
+    for n in (4096, 4097):
+        x = torch.randn(2, n, device=device)
+        r = torch.randn(2, n, device=device)
+        w = torch.randn(n, device=device)
+        y, h = tk.fused_add_rmsnorm_v2(x, r, w, eps=1e-6)
+        y_ref, h_ref = ref.fused_add_rmsnorm(x, r, w, eps=1e-6)
+        rep.check(f"融合版阈值边界 N={n}",
+                  torch.allclose(y, y_ref, atol=1e-4)
+                  and torch.allclose(h, h_ref, atol=1e-4),
+                  f"y误差 {max_abs_diff(y, y_ref):.2e}")
+
 
 # ============================================================
 # 主流程
@@ -242,6 +364,9 @@ def main():
     test_rmsnorm(rep, device)
     test_fused_add_rmsnorm(rep, device)
     test_swiglu(rep, device)
+    test_rope(rep, device)
+    test_rope_property(rep, device)
+    test_qkv_split_rope(rep, device)
     test_edge_cases(rep, device)
 
     ok = rep.summary()

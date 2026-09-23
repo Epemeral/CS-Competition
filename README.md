@@ -20,8 +20,15 @@ python -m venv --system-site-packages .venv
 - `t1/core.py`：与模型无关的校验逻辑。
 - `kernels/`：T4 阶段的 Triton 融合算子工作台（参考实现 → kernel → 正确性验证 → 性能基准）。
   独立于 T1，可在 Colab / DCU 集群上单独运行，详见 `kernels/README.md`。
+- `scripts/qwen25_amdgpu_benchmark.py`：方式三 AMDGPU/ROCm 上的 Qwen2.5-7B Transformers 基线与吞吐基准。
+- `scripts/inspect_datasets.py`：盘点外部 JSON/JSONL/Parquet 数据集的字段和样本规模。
+- `scripts/convert_datasets.py`：将 LongBench、HelloBench、AX、MMLU-Pro、tau2 转成统一 JSONL 合约。
+- `notebooks/amdgpu_qwen25_7b.ipynb`：ModelScope + AMDGPU Notebook 入口。
 - `docs/T1学习指南.md`：概念和本地练习。
 - `docs/T1代码解构.md`：执行链路和代码说明。
 - `docs/后续步骤.md`：DCU 账号到位后的路线。
+- `docs/方式三AMDGPU Notebook指南.md`：方式三环境的安装、基线和优化顺序。
+- `docs/数据集接入计划.md`：五个外部数据集的用途、优先级和 Notebook 接入顺序。
+- `docs/Notebook文件更新教程.md`：生成、同步、运行和提交 Notebook 的操作步骤。
 
 拿到组委会镜像后，以官方 `baseline.py`、`evaluate.py`、模型路径和评测集为准，并把环境信息写入实验记录。

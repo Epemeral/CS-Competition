@@ -99,6 +99,18 @@ def bytes_for_swiglu(shape, dtype_bytes: int = 4) -> int:
     return numel * dtype_bytes * 3
 
 
+def bytes_for_rope(bh: int, t: int, d: int, dtype_bytes: int = 4) -> int:
+    """RoPE 搬运的字节数：读 q + 写 out + 读 cos/sin"""
+    return bh * t * d * dtype_bytes * 2 + 2 * t * d * dtype_bytes
+
+
+def bytes_for_qkv_rope(b: int, t: int, h: int, d: int,
+                       dtype_bytes: int = 4) -> int:
+    """QKV 切分 + RoPE 搬运的字节数：读 qkv(3HD) + 写 q/k/v(3HD) + 读 cos/sin"""
+    hd = h * d
+    return b * t * 3 * hd * dtype_bytes * 2 + 2 * t * d * dtype_bytes
+
+
 def bandwidth_gbps(nbytes: int, ms: float) -> float:
     """带宽 = 字节数 / 时间，单位 GB/s"""
     if ms <= 0:

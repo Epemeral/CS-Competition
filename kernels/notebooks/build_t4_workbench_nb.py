@@ -50,6 +50,21 @@ print('Platform:', platform.platform())
 """)
 
 code("""
+# 设备指纹：ROCm / CUDA 两套栈要分清楚，否则报告里的设备描述会写错。
+# 注意 torch.cuda.get_device_capability() 在 ROCm 环境下可能返回无意义的值，
+# 判断设备真身要以 device_summary 打印的型号 + nvidia-smi / rocm-smi 为准。
+print('设备名 :', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a')
+print('设备数 :', torch.cuda.device_count())
+print('HIP    :', getattr(torch.version, 'hip', None))
+print('CUDA   :', torch.version.cuda)
+if torch.cuda.is_available():
+    print('显存   :', round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 1), 'GiB')
+
+import triton
+print('Triton :', triton.__version__)
+""")
+
+code("""
 from pathlib import Path
 import importlib
 import shutil
@@ -200,6 +215,29 @@ md("""
 ## 3. 单算子 benchmark 与 autotune
 
 RMSNorm 和 SwiGLU 是访存受限算子。SwiGLU 已按 block/warp autotune；RMSNorm 的 autotune 搜索 warp 配置，`rmsnorm_v2` 只在维度超过 block cap 时分块，避免 Qwen2.5 的 3584 维度被双遍读取。首次调用包含编译，不要把首次调用当作 steady-state。
+
+### 融合 Add+RMSNorm 的三个版本
+
+`fused_add_rmsnorm` 走了三代，每一代解决上一代的具体瓶颈：
+
+| 版本 | 策略 | 适用场景 | 已知问题 |
+|---|---|---|---|
+| v1（整行处理） | 一个 program 处理整行 | 小 N | **N 大时寄存器溢出**：`next_power_of_2(18944)=32768`，一个 program 要持有 32768 个 fp32 |
+| v2（分块归约） | BLOCK_N 固定上限，循环分块 | 中等 N | 第二遍**重复读取 X/R** 并重算 h，大 N 时带宽压力大 |
+| **v3（两阶段）** | 阶段1 把 h 写回显存，阶段2 只读 h 做归一化 | **大 N** | 多一次 h 的写+读 |
+
+v3 的取舍值得记一笔：它用「多一次 h 的 HBM 往返」换「不再重复读 X/R」。当 N 很大时，X 和 R 是两份数据、h 只有一份，所以 v3 的读取量更小。
+
+```text
+v2 的访存：读 X + 读 R  →  算 h（第一遍）
+           读 X + 读 R  →  再算 h 用于归一化（第二遍）  ← 重复！
+           ↓
+v3 的访存：读 X + 读 R → 写 h → 存 partial（阶段1）
+           读 h + 读 W → 写 y                    （阶段2）  ← 只读一份
+```
+
+三个版本都保持同一个 `(y, h)` 契约，所以可以直接互换、逐项消融。
+`v3` 内部有自适应退化：`N <= block_cap` 时自动走 v1，避免小尺寸下被双阶段启动开销拖累。
 """)
 
 code("""
@@ -232,10 +270,74 @@ else:
 """)
 
 md("""
-## 4. 结果解读与后续路线
+## 4. 三个版本的横向对比
+
+上面那格只打了「最佳加速比」。这一格把 `fused_add_rmsnorm` 的 v1 / v2 / v3 拉出来逐行对比 ——
+这是写报告时最有说服力的一张表，因为它同时展示了**问题**（v1 在大 N 崩掉）和**解法**（v2/v3 修回来）。
+
+bench 里额外加了一组 `N` 扫描（`1024 / 3584 / 4096 / 8192 / 12288 / 18944`），
+专门跨过 `block_cap=4096` 这个分界点，这样才看得出**交叉发生在哪里**。
+""")
+
+code("""
+from pathlib import Path
+import json
+
+result_dir = KERNELS.parent / 'results' / 't4'
+files = sorted(result_dir.glob('bench_*.json'))
+if not files:
+    print('还没有 bench JSON，先跑上一格。')
+else:
+    rows = json.loads(files[-1].read_text(encoding='utf-8')).get('fused_add_rmsnorm', [])
+
+    print('=' * 96)
+    print('融合 Add+RMSNorm：v1（整行） / v2（分块归约） / v3（两阶段）')
+    print('=' * 96)
+    print(f"  {'形状':<16}{'dtype':<10}{'分开':>9}{'v1':>9}{'v2':>9}{'v3':>9}"
+          f"{'v1加速':>8}{'v2加速':>8}{'v3加速':>8}  {'最优':<5}")
+    print('-' * 96)
+
+    for r in rows:
+        s1 = r.get('speedup_v1') or 0
+        s2 = r.get('speedup_v2') or 0
+        s3 = r.get('speedup_v3') or 0
+        best = max([('v1', s1), ('v2', s2), ('v3', s3)], key=lambda t: t[1])[0]
+
+        print(f"  {str(r.get('shape')):<16}{str(r.get('dtype')):<10}"
+              f"{r.get('unfused_ms', 0):>9.3f}"
+              f"{r.get('v1_ms', 0):>9.3f}"
+              f"{r.get('v2_ms', 0):>9.3f}"
+              f"{r.get('v3_ms', 0):>9.3f}"
+              f"{s1:>7.2f}x{s2:>7.2f}x{s3:>7.2f}x   {best}")
+
+    # ---- 按 N 分组，找交叉点 ----
+    print()
+    print('按 N 看趋势（取该 N 下三种 dtype 的平均）：')
+    print(f"  {'N':>8}{'形状':>14}   {'v1':>8}{'v2':>8}{'v3':>8}   最优")
+    print('-' * 60)
+
+    by_n = {}
+    for r in rows:
+        n = r['shape'][-1]
+        by_n.setdefault(n, []).append(r)
+
+    for n in sorted(by_n):
+        group = by_n[n]
+        avg = lambda key: sum(x.get(key) or 0 for x in group) / len(group)
+        a1, a2, a3 = avg('speedup_v1'), avg('speedup_v2'), avg('speedup_v3')
+        best = max([('v1', a1), ('v2', a2), ('v3', a3)], key=lambda t: t[1])[0]
+        flag = '  ← 分界点' if n == 4096 else ''
+        print(f"  {n:>8}{str(group[0]['shape']):>14}   "
+              f"{a1:>7.2f}x{a2:>7.2f}x{a3:>7.2f}x   {best}{flag}")
+""")
+
+md("""
+## 5. 结果解读与后续路线
 
 - 单算子加速不等于端到端加速；必须测 vLLM/eager 的 TTFT、TPOT、吞吐、P50/P95 和峰值显存。
 - 如果 RMSNorm/SwiGLU 占比低，继续堆小 kernel 的收益有限，应转向 attention、KV cache 或调度 profiling。
+- **v1 → v2 → v3 这条链本身就是一份完整的优化叙事**：发现问题（寄存器 spill）→ 第一版解法（分块归约）→ 发现新问题（重复读输入）→ 第二版解法（两阶段）。报告里按这个顺序讲，比单纯堆加速比更有说服力。
+- 小尺寸下（如 `(1, 3584)`）注意启动开销占比；SwiGLU 在极小尺寸可能低于 1.0x，属于正常现象，应记录而不是隐藏。
 - FlashAttention、PagedAttention 和量化属于后续高风险方向，先复用参考公式和测试方法，再在 DCU 上重新验证，不能直接搬运 CUDA 数字。
 - 保存设备名、PyTorch/Triton/DTK 版本、commit、warmup、重复次数和原始 JSON，报告才能复现。
 """)

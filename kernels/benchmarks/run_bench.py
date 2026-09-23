@@ -43,9 +43,22 @@ BENCH_SHAPES = [
     (1, 3584),        # 单条推理（batch=1）
     (32, 3584),       # 小批量
     (128, 3584),      # 中批量
-    (512, 3584),      # 大批量 ← 新增：小尺寸喂不饱 GPU，必须加大才测得出真实带宽
-    (2048, 3584),     # 超大 ← 新增
-    (512, 18944),     # 大 N ← 新增：专门暴露 v1 的 BLOCK_N 爆炸问题
+    (512, 3584),      # 大批量 ← 小尺寸喂不饱 GPU，必须加大才测得出真实带宽
+    (2048, 3584),     # 超大
+    (512, 18944),     # 大 N ← 暴露 v1 的 BLOCK_N 爆炸问题
+    (2048, 18944),    # 大 N + 大队列 ← v2/v3 的交叉区，v3 优势开始显现
+]
+
+# ---- 专测融合 Add+RMSNorm 的「N 扫描」----
+# v1/v2/v3 的分界点是 N=4096（block_cap），所以要跨过分界点采样，
+# 才能看出「v1 何时崩、v2 何时被 v3 反超」。只测一个 18944 画不出趋势。
+FUSED_N_SWEEP = [
+    (256, 1024),      # N < block_cap：走 v1 退化路径
+    (256, 3584),      # Qwen2.5 hidden，N < block_cap
+    (256, 4096),      # 正好在分界点
+    (256, 8192),      # N > block_cap：v2 生效
+    (256, 12288),     # 继续加压
+    (256, 18944),     # Qwen2.5 intermediate，N >> block_cap → v3 应有明显优势
 ]
 
 BENCH_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
@@ -114,12 +127,13 @@ def bench_fusion_gain(device, peak_bw, results):
     """对比「不融合」和「融合」—— 这是最有说服力的一组数据。"""
     print()
     print("=" * 96)
-    print("融合收益：分开做 vs 融合 v1（整行） vs 融合 v2（分块归约）")
+    print("融合收益：分开做 vs 融合 v1（整行） vs 融合 v2（分块归约） vs 融合 v3（两阶段）")
     print("=" * 96)
     bu.header(f"  {'形状':<15}{'dtype':<9}{'分开':>9}{'融合v1':>9}{'融合v2':>9}{'融合v3':>9}"
               f"{'v2加速':>8}{'v3加速':>8}{'v3带宽':>10}{'利用率':>8}")
 
-    for shape in BENCH_SHAPES:
+    # 先跑常规形状，再跑 N 扫描（N 扫描单独标记，便于画趋势图）
+    for shape in list(BENCH_SHAPES) + list(FUSED_N_SWEEP):
         for dtype in BENCH_DTYPES:
             x = torch.randn(*shape, device=device, dtype=dtype)
             r = torch.randn(*shape, device=device, dtype=dtype)
@@ -146,7 +160,9 @@ def bench_fusion_gain(device, peak_bw, results):
             bw = bu.bandwidth_gbps(nb, t_v3["median_ms"])
             util = bw / peak_bw * 100 if peak_bw else None
 
-            line = (f"  {str(shape):<15}{str(dtype).split('.')[-1]:<9}"
+            # N 扫描的形状加标记，写报告时好区分
+            tag = " *N" if list(shape) in [list(s) for s in FUSED_N_SWEEP] else ""
+            line = (f"  {str(shape) + tag:<15}{str(dtype).split('.')[-1]:<9}"
                     f"{t_un['median_ms']:>9.3f}"
                     f"{t_v1['median_ms']:>9.3f}"
                     f"{t_v2['median_ms']:>9.3f}{t_v3['median_ms']:>9.3f}"

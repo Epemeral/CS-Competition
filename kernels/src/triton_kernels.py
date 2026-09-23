@@ -160,6 +160,82 @@ def fused_add_rmsnorm(
     return y.view_as(x), h.view_as(x)
 
 
+# ---- v2：分块归约版（和 RMSNorm v2 同样的思路）----
+# 实测数据说明问题：
+#   (512, 18944) fp32  分开做 1.645ms  融合 v1 5.282ms  → 0.31x（比不融合还慢！）
+# 原因和 RMSNorm v1 一样：BLOCK_N = next_power_of_2(18944) = 32768，寄存器爆掉。
+#
+# v2 用分块归约：BLOCK_N 固定上限，循环两遍。
+# 代价是 h = x + r 要算两次（很便宜，一次加法），换来寄存器压力恒定。
+
+@triton.jit
+def _add_rmsnorm_loop_kernel(
+    X, R, W, Y, H,
+    stride_x_row, stride_y_row, stride_h_row,
+    N, eps,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+
+    # ---- 第一遍：算 h 并累加 sum(h²) ----
+    sum_sq = 0.0
+    for off in range(0, N, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)
+        mask = cols < N
+        x = tl.load(X + row * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
+        r = tl.load(R + row * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
+        h = x + r
+        sum_sq += tl.sum(h * h, axis=0)
+
+    rrms = 1.0 / tl.sqrt(sum_sq / N + eps)
+
+    # ---- 第二遍：重算 h，写出 h 和 y ----
+    for off in range(0, N, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)
+        mask = cols < N
+        x = tl.load(X + row * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
+        r = tl.load(R + row * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+
+        h = x + r
+        y = h * rrms * w
+
+        tl.store(H + row * stride_h_row + cols, h.to(H.dtype.element_ty), mask=mask)
+        tl.store(Y + row * stride_y_row + cols, y.to(Y.dtype.element_ty), mask=mask)
+
+
+def fused_add_rmsnorm_v2(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    block_cap: int = 4096,
+):
+    """融合 Add + RMSNorm 的分块归约版。返回 (y, h)"""
+    assert x.is_cuda
+    x = x.contiguous()
+    residual = residual.contiguous()
+    N = x.shape[-1]
+
+    x2d = x.view(-1, N)
+    r2d = residual.view(-1, N)
+    M = x2d.shape[0]
+
+    y = torch.empty_like(x2d)
+    h = torch.empty_like(x2d)
+
+    BLOCK_N = min(triton.next_power_of_2(N), block_cap)
+    grid = (M,)
+
+    _add_rmsnorm_loop_kernel[grid](
+        x2d, r2d, weight, y, h,
+        x2d.stride(0), y.stride(0), h.stride(0),
+        N, eps,
+        BLOCK_N=BLOCK_N,
+    )
+    return y.view_as(x), h.view_as(x)
+
+
 # ============================================================
 # 三、SwiGLU
 # ============================================================

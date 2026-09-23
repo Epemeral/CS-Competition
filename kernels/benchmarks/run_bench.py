@@ -112,11 +112,11 @@ def bench_rmsnorm(device, peak_bw, results):
 def bench_fusion_gain(device, peak_bw, results):
     """对比「不融合」和「融合」—— 这是最有说服力的一组数据。"""
     print()
-    print("=" * 78)
-    print("融合收益：add + rmsnorm 分开做 vs 融合成一个 kernel")
-    print("=" * 78)
-    bu.header(f"  {'形状':<16}{'dtype':<10}{'分开':>10}{'融合':>10}"
-              f"{'加速比':>9}{'带宽':>11}{'利用率':>9}")
+    print("=" * 96)
+    print("融合收益：分开做 vs 融合 v1（整行） vs 融合 v2（分块归约）")
+    print("=" * 96)
+    bu.header(f"  {'形状':<15}{'dtype':<9}{'分开':>9}{'融合v1':>9}{'融合v2':>9}"
+              f"{'v1加速':>8}{'v2加速':>8}{'v2带宽':>10}{'利用率':>8}")
 
     for shape in BENCH_SHAPES:
         for dtype in BENCH_DTYPES:
@@ -125,14 +125,14 @@ def bench_fusion_gain(device, peak_bw, results):
             w = torch.randn(shape[-1], device=device, dtype=dtype)
 
             def unfused():
-                h = x + r                      # kernel 1：写 h 到 HBM
-                return ref.rmsnorm(h, w, eps=1e-6)   # kernel 2：再读 h
-
-            def fused():
-                return tk.fused_add_rmsnorm(x, r, w, eps=1e-6)
+                h = x + r                             # kernel 1：写 h 到 HBM
+                return ref.rmsnorm(h, w, eps=1e-6)    # kernel 2：再读 h
 
             t_un = bu.bench(unfused, warmup=WARMUP, rep=REP)
-            t_fu = bu.bench(fused, warmup=WARMUP, rep=REP)
+            t_v1 = bu.bench(lambda: tk.fused_add_rmsnorm(x, r, w, eps=1e-6),
+                            warmup=WARMUP, rep=REP)
+            t_v2 = bu.bench(lambda: tk.fused_add_rmsnorm_v2(x, r, w, eps=1e-6),
+                            warmup=WARMUP, rep=REP)
 
             # 融合版搬运量：读 x + 读 r + 读 w + 写 y + 写 h
             m = 1
@@ -140,22 +140,30 @@ def bench_fusion_gain(device, peak_bw, results):
                 m *= s
             n = shape[-1]
             nb = m * n * x.element_size() * 4 + n * x.element_size()
-            bw = bu.bandwidth_gbps(nb, t_fu["median_ms"])
+            bw = bu.bandwidth_gbps(nb, t_v2["median_ms"])
             util = bw / peak_bw * 100 if peak_bw else None
 
-            line = (f"  {str(shape):<16}{str(dtype).split('.')[-1]:<10}"
-                    f"{t_un['median_ms']:>10.3f}{t_fu['median_ms']:>10.3f}"
-                    f"{t_un['median_ms'] / t_fu['median_ms']:>8.2f}x"
+            line = (f"  {str(shape):<15}{str(dtype).split('.')[-1]:<9}"
+                    f"{t_un['median_ms']:>9.3f}"
+                    f"{t_v1['median_ms']:>9.3f}"
+                    f"{t_v2['median_ms']:>9.3f}"
+                    f"{t_un['median_ms'] / t_v1['median_ms']:>7.2f}x"
+                    f"{t_un['median_ms'] / t_v2['median_ms']:>7.2f}x"
                     f"{bw:>10.1f}")
-            line += f"{util:>8.1f}%" if util else f"{'—':>9}"
+            line += f"{util:>7.1f}%" if util else f"{'—':>8}"
             print(line)
 
             results["fused_add_rmsnorm"].append({
                 "shape": list(shape),
                 "dtype": str(dtype).split(".")[-1],
                 "unfused_ms": t_un["median_ms"],
-                "fused_ms": t_fu["median_ms"],
-                "speedup": t_un["median_ms"] / t_fu["median_ms"],
+                "v1_ms": t_v1["median_ms"],
+                "v2_ms": t_v2["median_ms"],
+                # 兼容旧字段名（v2 为推荐版本）
+                "fused_ms": t_v2["median_ms"],
+                "speedup": t_un["median_ms"] / t_v2["median_ms"],
+                "speedup_v1": t_un["median_ms"] / t_v1["median_ms"],
+                "speedup_v2": t_un["median_ms"] / t_v2["median_ms"],
                 "bandwidth_gbps": bw,
                 "bandwidth_util_pct": util,
             })
@@ -215,21 +223,28 @@ def print_summary(results):
         if not rows or name.startswith("_"):
             continue
         speedups = [r["speedup"] for r in rows]
-        best = max(rows, key=lambda r: r["speedup"])
+        best_sp = max(rows, key=lambda r: r["speedup"])
+
         print(f"\n  {name}")
         print(f"    平均加速比 : {sum(speedups) / len(speedups):.2f}x")
-        print(f"    最佳加速比 : {best['speedup']:.2f}x"
-              f"  （{best['shape']} {best['dtype']}）")
-        if best.get("bandwidth_util_pct"):
-            print(f"    最佳带宽利用率 : {best['bandwidth_util_pct']:.1f}%")
+        print(f"    最佳加速比 : {best_sp['speedup']:.2f}x"
+              f"  （{best_sp['shape']} {best_sp['dtype']}）")
 
-        # RMSNorm 额外给出 v1 / v2 对比
-        if name == "rmsnorm" and rows[0].get("speedup_v1") is not None:
+        # ⚠️ 带宽利用率要单独取最大值 —— 它和加速比的最优行往往不是同一个
+        #    （小尺寸数据量小、加速比看着高，但利用率极低，会误导判断）
+        bw_rows = [r for r in rows if r.get("bandwidth_util_pct")]
+        if bw_rows:
+            best_bw = max(bw_rows, key=lambda r: r["bandwidth_util_pct"])
+            print(f"    最佳带宽利用率 : {best_bw['bandwidth_util_pct']:.1f}%"
+                  f"  （{best_bw['shape']} {best_bw['dtype']}）")
+
+        # v1 / v2 对比
+        if rows[0].get("speedup_v1") is not None:
             s1 = [r["speedup_v1"] for r in rows]
             s2 = [r["speedup_v2"] for r in rows]
             print(f"    ├─ v1（整行处理）  平均 : {sum(s1) / len(s1):.2f}x")
             print(f"    └─ v2（分块归约）  平均 : {sum(s2) / len(s2):.2f}x")
-            gains = [(r, r["speedup_v2"] / r["speedup_v1"]) for r in rows]
+            gains = [(r, r["speedup_v2"] / max(r["speedup_v1"], 1e-9)) for r in rows]
             g_best = max(gains, key=lambda t: t[1])
             print(f"       v2 相对 v1 最大提升 : {g_best[1]:.2f}x"
                   f"  （{g_best[0]['shape']} {g_best[0]['dtype']}）")

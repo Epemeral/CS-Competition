@@ -363,7 +363,172 @@ def rmsnorm_v2(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6,
 
 
 # ============================================================
-# 五、自测（需要 GPU）
+# 五、RoPE（旋转位置编码）
+# ============================================================
+# RoPE 做什么：把「位置信息」旋转进 q / k 向量。
+#
+# 数学上是对每一对维度 (2i, 2i+1) 做一次二维旋转：
+#     out[2i]   = x[2i]   * cos(θ) - x[2i+1] * sin(θ)
+#     out[2i+1] = x[2i+1] * cos(θ) + x[2i]   * sin(θ)
+#
+# 妙处在于：两个位置之间的**相对关系只取决于它们的距离差**，
+# 与绝对位置无关 —— 这让模型更容易外推到更长的序列。
+#
+# 为什么要写成融合 kernel：
+#     不融合的话，PyTorch 要启动 4~5 个 kernel：
+#     cos 计算、sin 计算、乘法、rotate_half（cat + neg）、再乘再加。
+#     融合后只读一次 q、写一次 out，cos/sin 从表里查。
+#
+# 注意：RoPE 是 memory-bound 的 —— 它只做少量算术，主要成本在搬运数据。
+
+@triton.jit
+def _rope_fwd_kernel(
+    Q, COS, SIN, OUT,
+    stride_qbh, stride_obh,
+    T,
+    D: tl.constexpr,
+):
+    """每个 program 处理一个 (b,h) 组合在一个位置 t 上的整个 head 向量。
+
+    维度契约：
+        Q   : (B, H, T, D)  —— 把 (B,H) 合并成一维，共 B*H 个
+        COS : (T, D)
+        SIN : (T, D)
+        OUT : (B, H, T, D)
+    """
+    pid_bh = tl.program_id(0)
+    t = tl.program_id(1)
+
+    half = tl.arange(0, D // 2)          # D 是 constexpr，D//2 也是编译期常量
+
+    base = pid_bh * stride_qbh + t * D
+    out_base = pid_bh * stride_obh + t * D
+
+    # 读 head 向量的前后两半
+    x1 = tl.load(Q + base + half).to(tl.float32)
+    x2 = tl.load(Q + base + half + D // 2).to(tl.float32)
+
+    # cos/sin 只读前半 —— 表的前后半是相同的（配合 rotate_half 的写法）
+    c = tl.load(COS + t * D + half).to(tl.float32)
+    s = tl.load(SIN + t * D + half).to(tl.float32)
+
+    # out = x * cos + rotate_half(x) * sin，其中 rotate_half = [-x2, x1]
+    out1 = x1 * c - x2 * s
+    out2 = x2 * c + x1 * s
+
+    tl.store(OUT + out_base + half, out1.to(OUT.dtype.element_ty))
+    tl.store(OUT + out_base + half + D // 2, out2.to(OUT.dtype.element_ty))
+
+
+def rope(q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Triton 版 RoPE。q: (B, H, T, D)"""
+    assert q.is_cuda, "Triton kernel 需要 CUDA/ROCm 设备"
+    q = q.contiguous()
+    B, H, T, D = q.shape
+    out = torch.empty_like(q)
+
+    stride_bh = T * D
+    grid = (B * H, T)
+
+    _rope_fwd_kernel[grid](q, cos, sin, out, stride_bh, stride_bh, T, D=D)
+    return out
+
+
+# ============================================================
+# 六、QKV 切分 + RoPE 融合
+# ============================================================
+# 推理里的真实流程：
+#     qkv = x @ W_qkv^T          一次矩阵乘算出 Q/K/V    (B, T, 3*H*D)
+#     q, k, v = split(qkv)       切分
+#     q, k = rope(q), rope(k)    只有 q/k 需要位置信息，v 不需要
+#
+# 不融合 = 3 次 kernel launch + 中间张量来回落 HBM。
+# 融合 = 一次读写搞定。
+#
+# 这是注意力层里最典型的「小算子链」——正是融合收益最大的地方。
+
+@triton.jit
+def _qkv_rope_kernel(
+    QKV, COS, SIN, Q_OUT, K_OUT, V_OUT,
+    T, H,
+    D: tl.constexpr,
+    HD: tl.constexpr,
+):
+    """融合：切分 QKV + 对 Q/K 应用 RoPE + 写出。
+
+    grid = (B, T, H)，每个 program 处理一个 head 的 D 维向量。
+    """
+    pid_b = tl.program_id(0)
+    pid_t = tl.program_id(1)
+    pid_h = tl.program_id(2)
+
+    half = tl.arange(0, D // 2)
+
+    # qkv 里这一行的基址：(B, T, 3*HD)
+    row_base = pid_b * (T * 3 * HD) + pid_t * (3 * HD)
+    h_off = pid_h * D
+
+    # 输出基址：q/k/v 各自是 (B, T, HD)
+    out_base = pid_b * (T * HD) + pid_t * HD + h_off
+
+    # cos/sin（同一位置 t，所有 head 共用）
+    c = tl.load(COS + pid_t * D + half).to(tl.float32)
+    s = tl.load(SIN + pid_t * D + half).to(tl.float32)
+
+    # ---- Q：旋转 ----
+    q_base = row_base + h_off
+    q1 = tl.load(QKV + q_base + half).to(tl.float32)
+    q2 = tl.load(QKV + q_base + half + D // 2).to(tl.float32)
+    tl.store(Q_OUT + out_base + half,
+             (q1 * c - q2 * s).to(Q_OUT.dtype.element_ty))
+    tl.store(Q_OUT + out_base + half + D // 2,
+             (q2 * c + q1 * s).to(Q_OUT.dtype.element_ty))
+
+    # ---- K：旋转 ----
+    k_base = row_base + HD + h_off
+    k1 = tl.load(QKV + k_base + half).to(tl.float32)
+    k2 = tl.load(QKV + k_base + half + D // 2).to(tl.float32)
+    tl.store(K_OUT + out_base + half,
+             (k1 * c - k2 * s).to(K_OUT.dtype.element_ty))
+    tl.store(K_OUT + out_base + half + D // 2,
+             (k2 * c + k1 * s).to(K_OUT.dtype.element_ty))
+
+    # ---- V：不旋转，原样搬运 ----
+    v_base = row_base + 2 * HD + h_off
+    v1 = tl.load(QKV + v_base + half)
+    v2 = tl.load(QKV + v_base + half + D // 2)
+    tl.store(V_OUT + out_base + half, v1)
+    tl.store(V_OUT + out_base + half + D // 2, v2)
+
+
+def qkv_split_rope(
+    qkv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+):
+    """Triton 版 QKV 切分 + RoPE。qkv: (B, T, 3*H*D)，返回 (q, k, v)。"""
+    assert qkv.is_cuda, "Triton kernel 需要 CUDA/ROCm 设备"
+    qkv = qkv.contiguous()
+    B, T, three_hd = qkv.shape
+    HD = num_heads * head_dim
+
+    q = torch.empty((B, T, HD), device=qkv.device, dtype=qkv.dtype)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+
+    grid = (B, T, num_heads)
+    _qkv_rope_kernel[grid](
+        qkv, cos, sin, q, k, v,
+        T, num_heads,
+        D=head_dim, HD=HD,
+    )
+    return q, k, v
+
+
+# ============================================================
+# 七、自测（需要 GPU）
 # ============================================================
 if __name__ == "__main__":
     import sys

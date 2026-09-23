@@ -106,6 +106,111 @@ def swiglu_mlp(
 
 
 # ============================================================
+# 三、RoPE（旋转位置编码）
+# ============================================================
+def build_rope_cache(seq_len: int, head_dim: int, base: float = 10000.0,
+                     device="cpu", dtype=torch.float32):
+    """构造 RoPE 的 cos / sin 表。
+
+    数学：
+        inv_freq[i] = 1 / base^(2i/d)        i = 0 .. d/2-1
+        angle(t, i) = t * inv_freq[i]
+        cos[t, i]   = cos(angle(t, i))
+        sin[t, i]   = sin(angle(t, i))
+
+    返回形状 (T, D) 的表，**前后半相同** —— 这是为了配合 rotate_half 的写法
+    （HuggingFace 也是这么存的）。
+
+    base 越大，不同位置的频率差异越小（能区分的距离越远）。
+    默认 10000 是绝大多数模型用的值。
+    """
+    half = head_dim // 2
+    i = torch.arange(half, device=device, dtype=torch.float32)
+    inv_freq = 1.0 / (base ** (2.0 * i / head_dim))       # (half,)
+
+    t = torch.arange(seq_len, device=device, dtype=torch.float32)
+    angles = t[:, None] * inv_freq[None, :]                # (T, half)
+
+    cos_half = torch.cos(angles)
+    sin_half = torch.sin(angles)
+    # 前后半拼成 (T, D)
+    cos = torch.cat([cos_half, cos_half], dim=-1)
+    sin = torch.cat([sin_half, sin_half], dim=-1)
+    return cos.to(dtype), sin.to(dtype)
+
+
+def rope(q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """RoPE：把位置信息「旋转」进 q / k 向量。
+
+    维度契约：
+        q   : (B, H, T, D)      D = head_dim
+        cos : (T, D)
+        sin : (T, D)
+        输出 : (B, H, T, D)
+
+    公式（HuggingFace 的 rotate_half 形式）：
+        out = q * cos + rotate_half(q) * sin
+
+        rotate_half(x) = cat(-x[D/2:], x[:D/2])
+
+    展开看就是「对每一对维度做旋转」：
+        out[:D/2] = q[:D/2] * cos - q[D/2:] * sin
+        out[D/2:] = q[D/2:] * cos + q[:D/2] * sin
+
+    这就是二维旋转矩阵 [cos -sin; sin cos] 作用在 (x1, x2) 上。
+    它的妙处：**两个位置的相对关系只取决于它们的距离差**，与绝对位置无关。
+    """
+    def rotate_half(x):
+        d = x.shape[-1]
+        x1 = x[..., : d // 2]
+        x2 = x[..., d // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+    # cos/sin 从 (T, D) 广播到 (1, 1, T, D)
+    cos = cos.unsqueeze(0).unsqueeze(0)
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    return q * cos + rotate_half(q) * sin
+
+
+def qkv_split_rope(
+    qkv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+):
+    """把一次投影出来的 QKV 切开，并对 Q / K 应用 RoPE。
+
+    这是推理里的真实流程：
+        qkv = x @ W_qkv^T          (B, T, 3*H*D)
+        q, k, v = split(qkv)       ← 切分
+        q, k = rope(q), rope(k)    ← 只有 q/k 需要位置信息，v 不需要
+
+    为什么要融合成一个算子：
+        不融合的话，「切分」+「rope(q)」+「rope(k)」是 3 次 kernel launch，
+        中间张量还要落 HBM 再读出来。融合后只读写一次。
+
+    维度契约：
+        qkv : (B, T, 3*H*D)
+        cos/sin : (T, D)
+        输出 : (q, k, v)，各 (B, T, H*D)
+    """
+    B, T, three_hd = qkv.shape
+    HD = num_heads * head_dim
+    assert three_hd == 3 * HD, f"qkv 最后一维应为 3*H*D={3*HD}，实际 {three_hd}"
+
+    q, k, v = qkv.split([HD, HD, HD], dim=-1)
+
+    def rot(x):
+        # (B, T, H*D) -> (B, H, T, D) -> rope -> 回到 (B, T, H*D)
+        xr = x.view(B, T, num_heads, head_dim).transpose(1, 2)
+        out = rope(xr, cos, sin)
+        return out.transpose(1, 2).reshape(B, T, HD)
+
+    return rot(q), rot(k), v
+
+
+# ============================================================
 # 三、自测（不依赖 triton，纯 torch 就能跑）
 # ============================================================
 if __name__ == "__main__":

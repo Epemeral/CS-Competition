@@ -211,7 +211,109 @@ def bench_swiglu(device, peak_bw, results):
 
 
 # ============================================================
-# 四、摘要
+# 四、RoPE
+# ============================================================
+def bench_rope(device, peak_bw, results):
+    print()
+    print("=" * 96)
+    print("RoPE：PyTorch 原生 vs Triton")
+    print("=" * 96)
+    bu.header(f"  {'(B,H,T,D)':<24}{'dtype':<9}{'PyTorch':>10}{'Triton':>10}"
+              f"{'加速比':>9}{'带宽':>10}{'利用率':>8}")
+
+    # Qwen2.5-7B: 28 个注意力头，head_dim=128
+    cases = [
+        (1, 28, 512, 128),
+        (4, 28, 512, 128),
+        (8, 28, 1024, 128),
+        (8, 4, 1024, 128),      # GQA 场景下的 KV 头（4 个）
+    ]
+
+    for dtype in BENCH_DTYPES:
+        for (B, H, T, D) in cases:
+            q = torch.randn(B, H, T, D, device=device, dtype=dtype)
+            cos, sin = ref.build_rope_cache(T, D, device=device, dtype=dtype)
+
+            t_ref = bu.bench(lambda: ref.rope(q, cos, sin),
+                             warmup=WARMUP, rep=REP)
+            t_tri = bu.bench(lambda: tk.rope(q, cos, sin),
+                             warmup=WARMUP, rep=REP)
+
+            nbytes = bu.bytes_for_rope(B * H, T, D, q.element_size())
+            bw = bu.bandwidth_gbps(nbytes, t_tri["median_ms"])
+            util = bw / peak_bw * 100 if peak_bw else None
+
+            line = (f"  {str((B, H, T, D)):<24}{str(dtype).split('.')[-1]:<9}"
+                    f"{t_ref['median_ms']:>10.3f}{t_tri['median_ms']:>10.3f}"
+                    f"{t_ref['median_ms'] / t_tri['median_ms']:>8.2f}x"
+                    f"{bw:>10.1f}")
+            line += f"{util:>7.1f}%" if util else f"{'—':>8}"
+            print(line)
+
+            results["rope"].append({
+                "shape": [B, H, T, D],
+                "dtype": str(dtype).split(".")[-1],
+                "pytorch_ms": t_ref["median_ms"],
+                "triton_ms": t_tri["median_ms"],
+                "speedup": t_ref["median_ms"] / t_tri["median_ms"],
+                "bandwidth_gbps": bw,
+                "bandwidth_util_pct": util,
+            })
+
+
+# ============================================================
+# 五、QKV 切分 + RoPE 融合
+# ============================================================
+def bench_qkv_rope(device, peak_bw, results):
+    print()
+    print("=" * 96)
+    print("QKV 切分 + RoPE：PyTorch 原生（3 次 kernel） vs Triton 融合（1 次）")
+    print("=" * 96)
+    bu.header(f"  {'(B,T,H,D)':<24}{'dtype':<9}{'PyTorch':>10}{'Triton':>10}"
+              f"{'加速比':>9}{'带宽':>10}{'利用率':>8}")
+
+    cases = [
+        (1, 512, 28, 128),
+        (4, 512, 28, 128),
+        (8, 1024, 28, 128),
+        (8, 1024, 4, 128),
+    ]
+
+    for dtype in BENCH_DTYPES:
+        for (B, T, H, D) in cases:
+            HD = H * D
+            qkv = torch.randn(B, T, 3 * HD, device=device, dtype=dtype)
+            cos, sin = ref.build_rope_cache(T, D, device=device, dtype=dtype)
+
+            t_ref = bu.bench(lambda: ref.qkv_split_rope(qkv, cos, sin, H, D),
+                             warmup=WARMUP, rep=REP)
+            t_tri = bu.bench(lambda: tk.qkv_split_rope(qkv, cos, sin, H, D),
+                             warmup=WARMUP, rep=REP)
+
+            nbytes = bu.bytes_for_qkv_rope(B, T, H, D, qkv.element_size())
+            bw = bu.bandwidth_gbps(nbytes, t_tri["median_ms"])
+            util = bw / peak_bw * 100 if peak_bw else None
+
+            line = (f"  {str((B, T, H, D)):<24}{str(dtype).split('.')[-1]:<9}"
+                    f"{t_ref['median_ms']:>10.3f}{t_tri['median_ms']:>10.3f}"
+                    f"{t_ref['median_ms'] / t_tri['median_ms']:>8.2f}x"
+                    f"{bw:>10.1f}")
+            line += f"{util:>7.1f}%" if util else f"{'—':>8}"
+            print(line)
+
+            results["qkv_split_rope"].append({
+                "shape": [B, T, H, D],
+                "dtype": str(dtype).split(".")[-1],
+                "pytorch_ms": t_ref["median_ms"],
+                "triton_ms": t_tri["median_ms"],
+                "speedup": t_ref["median_ms"] / t_tri["median_ms"],
+                "bandwidth_gbps": bw,
+                "bandwidth_util_pct": util,
+            })
+
+
+# ============================================================
+# 六、摘要
 # ============================================================
 def print_summary(results):
     print()
@@ -280,6 +382,8 @@ def main():
         "rmsnorm": [],
         "fused_add_rmsnorm": [],
         "swiglu": [],
+        "rope": [],
+        "qkv_split_rope": [],
     }
 
     try:
@@ -292,6 +396,8 @@ def main():
     bench_rmsnorm(device, peak_bw, results)
     bench_fusion_gain(device, peak_bw, results)
     bench_swiglu(device, peak_bw, results)
+    bench_rope(device, peak_bw, results)
+    bench_qkv_rope(device, peak_bw, results)
 
     print_summary(results)
 

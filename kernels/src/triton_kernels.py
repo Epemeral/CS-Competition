@@ -211,12 +211,24 @@ def fused_add_rmsnorm_v2(
     eps: float = 1e-6,
     block_cap: int = 4096,
 ):
-    """融合 Add + RMSNorm 的分块归约版。返回 (y, h)"""
+    """融合 Add + RMSNorm 的分块归约版（自适应）。返回 (y, h)
+
+    ⚠️ 和 rmsnorm_v2 一样：N <= block_cap 时退化为单遍版本。
+        分块归约要读两遍 x 和 r，小 N 时是纯负优化。
+        实测 (2048, 3584) fp32：
+            v1 单遍 0.577 ms (2.18x)
+            v2 分块 0.794 ms (1.59x)   ← 反而慢 38%
+    """
     assert x.is_cuda
     x = x.contiguous()
     residual = residual.contiguous()
     N = x.shape[-1]
 
+    # 小 N：单遍更快
+    if N <= block_cap:
+        return fused_add_rmsnorm(x, residual, weight, eps)
+
+    # 大 N：分块归约
     x2d = x.view(-1, N)
     r2d = residual.view(-1, N)
     M = x2d.shape[0]
@@ -224,14 +236,13 @@ def fused_add_rmsnorm_v2(
     y = torch.empty_like(x2d)
     h = torch.empty_like(x2d)
 
-    BLOCK_N = min(triton.next_power_of_2(N), block_cap)
     grid = (M,)
 
     _add_rmsnorm_loop_kernel[grid](
         x2d, r2d, weight, y, h,
         x2d.stride(0), y.stride(0), h.stride(0),
         N, eps,
-        BLOCK_N=BLOCK_N,
+        BLOCK_N=block_cap,
     )
     return y.view_as(x), h.view_as(x)
 
@@ -335,22 +346,37 @@ def _rmsnorm_loop_kernel(
 
 def rmsnorm_v2(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6,
                block_cap: int = 4096) -> torch.Tensor:
-    """分块归约版 RMSNorm。
+    """分块归约版 RMSNorm（自适应）。
 
     参数：
-        block_cap : BLOCK_N 的上限。N 小于它时行为和 v1 一样；
-                    N 大于它时循环分块，避免寄存器爆炸。
+        block_cap : BLOCK_N 的上限。N 超过它时才走分块归约路径。
+
+    ⚠️ 为什么要有「退化」逻辑：
+        分块归约要读**两遍** x（第一遍算 sum(x²)，第二遍算输出）。
+        当 N <= block_cap 时，单遍版本一次就能装下整行，读一遍就够 ——
+        这时分块归约是**纯负优化**。
+
+        实测 (2048, 3584) fp32：
+            v1 单遍 0.299 ms  (2.97x)
+            v2 分块 0.387 ms  (2.29x)   ← 反而慢 29%
+        因为 N=3584 < 4096，v2 的 BLOCK_N 和 v1 一样，却多读了一遍。
+
+        所以 N <= block_cap 时直接退化为单遍版本。
     """
     assert x.is_cuda, "Triton kernel 需要 CUDA/ROCm 设备"
     x = x.contiguous()
     N = x.shape[-1]
 
+    # 小 N：单遍更快，直接走 v1
+    if N <= block_cap:
+        return rmsnorm(x, weight, eps)
+
+    # 大 N：必须分块，否则 BLOCK_N 爆炸导致寄存器 spill
     x2d = x.view(-1, N)
     M = x2d.shape[0]
     y = torch.empty_like(x2d)
 
-    # 关键：BLOCK_N 取 min(N 的 2 次幂, block_cap)，而不是直接用 next_power_of_2(N)
-    BLOCK_N = min(triton.next_power_of_2(N), block_cap)
+    BLOCK_N = block_cap
     grid = (M,)
 
     _rmsnorm_loop_kernel[grid](

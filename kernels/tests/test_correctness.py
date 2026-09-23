@@ -306,6 +306,29 @@ def test_edge_cases(rep: Report, device: str):
               torch.allclose(out, out_ref, atol=1e-4),
               f"最大误差 {max_abs_diff(out, out_ref):.2e}")
 
+    # 6. 分块归约的阈值边界（block_cap=4096）——
+    #    N 在阈值两侧会走不同的代码路径，都要正确
+    for n in (4095, 4096, 4097, 8192):
+        x = torch.randn(2, n, device=device)
+        w = torch.randn(n, device=device)
+        y = tk.rmsnorm_v2(x, w, eps=1e-6)
+        y_ref = ref.rmsnorm(x, w, eps=1e-6)
+        rep.check(f"分块阈值边界 N={n}（{'单遍' if n <= 4096 else '分块'}路径）",
+                  torch.allclose(y, y_ref, atol=1e-4),
+                  f"最大误差 {max_abs_diff(y, y_ref):.2e}")
+
+    # 7. 融合版的分块阈值边界
+    for n in (4096, 4097):
+        x = torch.randn(2, n, device=device)
+        r = torch.randn(2, n, device=device)
+        w = torch.randn(n, device=device)
+        y, h = tk.fused_add_rmsnorm_v2(x, r, w, eps=1e-6)
+        y_ref, h_ref = ref.fused_add_rmsnorm(x, r, w, eps=1e-6)
+        rep.check(f"融合版阈值边界 N={n}",
+                  torch.allclose(y, y_ref, atol=1e-4)
+                  and torch.allclose(h, h_ref, atol=1e-4),
+                  f"y误差 {max_abs_diff(y, y_ref):.2e}")
+
 
 # ============================================================
 # 主流程

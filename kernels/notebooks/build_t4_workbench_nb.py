@@ -99,8 +99,17 @@ Qwen2.5-7B 使用 GQA：`hidden_size=3584`、`num_attention_heads=28`、`num_key
 """)
 
 code("""
-import reference as ref
+import importlib, inspect, sys
 import torch
+
+# Notebook 内核可能残留旧的 reference 模块；始终从本次定位的源码重新加载。
+sys.modules.pop('reference', None)
+importlib.invalidate_caches()
+import reference as ref
+print('reference loaded from:', ref.__file__)
+print('qkv_split_rope signature:', inspect.signature(ref.qkv_split_rope))
+if 'num_key_value_heads' not in inspect.signature(ref.qkv_split_rope).parameters:
+    raise RuntimeError('当前 reference.py 不支持 GQA，请上传最新 kernels/src/reference.py')
 
 qwen = dict(hidden_size=3584, num_attention_heads=28,
             num_key_value_heads=4, head_dim=128,

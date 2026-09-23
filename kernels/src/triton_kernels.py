@@ -250,6 +250,28 @@ def fused_add_rmsnorm_v2(
 # ============================================================
 # 三、SwiGLU
 # ============================================================
+# 【为什么给 SwiGLU 加 autotune】
+#   它是唯一一个「BLOCK 完全自由」的 kernel：
+#     · RMSNorm 的 BLOCK_N 由 N 决定（必须 ≥ N 或分块）
+#     · RoPE / QKV 的 block 由 head_dim 决定
+#     · SwiGLU 是纯逐元素操作，BLOCK 想设多少就设多少
+#
+#   实测问题：小尺寸下只有 0.66~0.72x（比 PyTorch 慢）。
+#   原因：BLOCK=1024 时 n=3584 只需要 4 个 program，
+#        T4 有 40 个 SM，绝大部分闲着。
+#
+#   所以让 Triton 自己扫参数找最优组合。
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK": 256}, num_warps=2),
+        triton.Config({"BLOCK": 512}, num_warps=4),
+        triton.Config({"BLOCK": 1024}, num_warps=4),
+        triton.Config({"BLOCK": 2048}, num_warps=8),
+        triton.Config({"BLOCK": 4096}, num_warps=8),
+    ],
+    key=["n_elements"],
+)
 @triton.jit
 def _swiglu_fwd_kernel(
     GATE, UP, OUT,
@@ -258,7 +280,7 @@ def _swiglu_fwd_kernel(
 ):
     """SwiGLU: silu(gate) * up
 
-    这是纯逐元素操作 —— 最适合入门的融合 kernel。
+    纯逐元素操作 —— 最适合入门的融合 kernel。
 
     融合点：
         silu(g) = g * sigmoid(g)  需要算 sigmoid 再乘
@@ -287,10 +309,10 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(gate)
 
     n = gate.numel()
-    BLOCK = 1024
-    grid = (triton.cdiv(n, BLOCK),)     # cdiv = 向上取整除法
+    # grid 依赖 autotune 选出的 BLOCK，所以用 lambda
+    grid = lambda meta: (triton.cdiv(n, meta["BLOCK"]),)
 
-    _swiglu_fwd_kernel[grid](gate, up, out, n, BLOCK=BLOCK)
+    _swiglu_fwd_kernel[grid](gate, up, out, n)
     return out
 
 

@@ -401,6 +401,15 @@ def main():
 
     print_summary(results)
 
+    print()
+    print("=" * 78)
+    print("SwiGLU autotune 选出的最优配置")
+    print("=" * 78)
+    try:
+        print(f"  {tk._swiglu_fwd_kernel.best_config}")
+    except Exception:
+        print("  （未获取到 autotune 配置）")
+
     # ---- 落盘 ----
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out = RESULTS_DIR / f"bench_{time.strftime('%Y%m%d_%H%M%S')}.json"

@@ -296,6 +296,24 @@ mean_square = tl.sum(x * x, axis=0) / BLOCK_N   # ❌ 用编译期的 BLOCK_N
 
 **融合版的加速比通常明显高于单纯的 rmsnorm**——因为省掉了中间张量 `h` 的两次 HBM 往返。
 
+## 实验 3：分块归约解决了什么问题
+
+`src/triton_kernels.py` 里有两个 RMSNorm 实现：
+
+| 版本 | 做法 | 适用场景 |
+|---|---|---|
+| `rmsnorm` (v1) | `BLOCK_N = next_power_of_2(N)`，整行一次处理 | N 较小 |
+| `rmsnorm_v2` | `BLOCK_N` 固定上限（4096）+ 循环分块 | **N 很大**（如 18944） |
+
+**为什么需要 v2**：N=18944 时 `next_power_of_2(18944) = 32768`，
+一个 program 要同时持有 **32768 个 fp32** → 寄存器爆掉、spill 到 local memory
+（走 HBM）→ **反而比 PyTorch 还慢**（实测 0.54x）。
+
+v2 用「读两次 x」换「寄存器压力恒定」——第二次读大概率命中 L2，比 spill 便宜得多。
+
+**看基准输出里 `(512, 18944)` 那一行**，对比 v1 和 v2 的耗时差距。
+这是 GPU kernel 的经典权衡，答辩时可以展开讲。
+
 ---
 
 ## 怎么在 Colab 里改代码

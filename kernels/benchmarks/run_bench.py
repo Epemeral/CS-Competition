@@ -40,10 +40,11 @@ RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 # ============================================================
 BENCH_SHAPES = [
     (1, 3584),        # 单条推理（batch=1）
-    (8, 3584),
-    (32, 3584),
-    (128, 3584),      # 高并发
-    (128, 18944),     # SwiGLU 的中间维度
+    (32, 3584),       # 小批量
+    (128, 3584),      # 中批量
+    (512, 3584),      # 大批量 ← 新增：小尺寸喂不饱 GPU，必须加大才测得出真实带宽
+    (2048, 3584),     # 超大 ← 新增
+    (512, 18944),     # 大 N ← 新增：专门暴露 v1 的 BLOCK_N 爆炸问题
 ]
 
 BENCH_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
@@ -57,11 +58,11 @@ REP = 100
 # ============================================================
 def bench_rmsnorm(device, peak_bw, results):
     print()
-    print("=" * 78)
-    print("RMSNorm：PyTorch 原生 vs Triton")
-    print("=" * 78)
-    bu.header(f"  {'形状':<16}{'dtype':<10}{'PyTorch':>10}{'Triton':>10}"
-              f"{'加速比':>9}{'带宽':>11}{'利用率':>9}")
+    print("=" * 96)
+    print("RMSNorm：PyTorch 原生 vs v1（整行处理） vs v2（分块归约）")
+    print("=" * 96)
+    bu.header(f"  {'形状':<15}{'dtype':<9}{'PyTorch':>9}{'v1':>9}{'v2':>9}"
+              f"{'v1加速':>8}{'v2加速':>8}{'v2带宽':>10}{'利用率':>8}")
 
     for shape in BENCH_SHAPES:
         for dtype in BENCH_DTYPES:
@@ -70,31 +71,38 @@ def bench_rmsnorm(device, peak_bw, results):
 
             t_ref = bu.bench(lambda: ref.rmsnorm(x, w, eps=1e-6),
                              warmup=WARMUP, rep=REP)
-            t_tri = bu.bench(lambda: tk.rmsnorm(x, w, eps=1e-6),
-                             warmup=WARMUP, rep=REP)
+            t_v1 = bu.bench(lambda: tk.rmsnorm(x, w, eps=1e-6),
+                            warmup=WARMUP, rep=REP)
+            t_v2 = bu.bench(lambda: tk.rmsnorm_v2(x, w, eps=1e-6),
+                            warmup=WARMUP, rep=REP)
 
             nbytes = bu.bytes_for_rmsnorm(shape, x.element_size())
-            bw = bu.bandwidth_gbps(nbytes, t_tri["median_ms"])
+            bw = bu.bandwidth_gbps(nbytes, t_v2["median_ms"])
             util = bw / peak_bw * 100 if peak_bw else None
 
-            line = (f"  {str(shape):<16}{str(dtype).split('.')[-1]:<10}"
-                    f"{t_ref['median_ms']:>10.3f}{t_tri['median_ms']:>10.3f}"
-                    f"{t_ref['median_ms'] / t_tri['median_ms']:>8.2f}x"
+            line = (f"  {str(shape):<15}{str(dtype).split('.')[-1]:<9}"
+                    f"{t_ref['median_ms']:>9.3f}"
+                    f"{t_v1['median_ms']:>9.3f}"
+                    f"{t_v2['median_ms']:>9.3f}"
+                    f"{t_ref['median_ms'] / t_v1['median_ms']:>7.2f}x"
+                    f"{t_ref['median_ms'] / t_v2['median_ms']:>7.2f}x"
                     f"{bw:>10.1f}")
-            line += f"{util:>8.1f}%" if util else f"{'—':>9}"
-            if t_tri["spread"] > 0.2:
-                line += "  ⚠️波动大"
+            line += f"{util:>7.1f}%" if util else f"{'—':>8}"
             print(line)
 
             results["rmsnorm"].append({
                 "shape": list(shape),
                 "dtype": str(dtype).split(".")[-1],
                 "pytorch_ms": t_ref["median_ms"],
-                "triton_ms": t_tri["median_ms"],
-                "speedup": t_ref["median_ms"] / t_tri["median_ms"],
+                "v1_ms": t_v1["median_ms"],
+                "v2_ms": t_v2["median_ms"],
+                # 兼容旧字段名
+                "triton_ms": t_v2["median_ms"],
+                "speedup": t_ref["median_ms"] / t_v2["median_ms"],
+                "speedup_v1": t_ref["median_ms"] / t_v1["median_ms"],
+                "speedup_v2": t_ref["median_ms"] / t_v2["median_ms"],
                 "bandwidth_gbps": bw,
                 "bandwidth_util_pct": util,
-                "spread": t_tri["spread"],
             })
 
 
@@ -214,6 +222,17 @@ def print_summary(results):
               f"  （{best['shape']} {best['dtype']}）")
         if best.get("bandwidth_util_pct"):
             print(f"    最佳带宽利用率 : {best['bandwidth_util_pct']:.1f}%")
+
+        # RMSNorm 额外给出 v1 / v2 对比
+        if name == "rmsnorm" and rows[0].get("speedup_v1") is not None:
+            s1 = [r["speedup_v1"] for r in rows]
+            s2 = [r["speedup_v2"] for r in rows]
+            print(f"    ├─ v1（整行处理）  平均 : {sum(s1) / len(s1):.2f}x")
+            print(f"    └─ v2（分块归约）  平均 : {sum(s2) / len(s2):.2f}x")
+            gains = [(r, r["speedup_v2"] / r["speedup_v1"]) for r in rows]
+            g_best = max(gains, key=lambda t: t[1])
+            print(f"       v2 相对 v1 最大提升 : {g_best[1]:.2f}x"
+                  f"  （{g_best[0]['shape']} {g_best[0]['dtype']}）")
 
 
 # ============================================================

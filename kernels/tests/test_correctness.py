@@ -96,19 +96,26 @@ def max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
 # 一、RMSNorm
 # ============================================================
 def test_rmsnorm(rep: Report, device: str):
-    print("\n【RMSNorm】")
+    print("\n【RMSNorm】v1=整行处理 / v2=分块归约")
     for shape in SHAPES:
         for dtype, atol, rtol in DTYPES:
             x = torch.randn(*shape, device=device, dtype=dtype)
             w = torch.randn(shape[-1], device=device, dtype=dtype)
 
             y_ref = ref.rmsnorm(x, w, eps=1e-6)
-            y_tri = tk.rmsnorm(x, w, eps=1e-6)
+            y_v1 = tk.rmsnorm(x, w, eps=1e-6)
+            y_v2 = tk.rmsnorm_v2(x, w, eps=1e-6)
 
-            ok = torch.allclose(y_ref, y_tri, atol=atol, rtol=rtol)
-            diff = max_abs_diff(y_ref, y_tri)
+            ok1 = torch.allclose(y_ref, y_v1, atol=atol, rtol=rtol)
+            ok2 = torch.allclose(y_ref, y_v2, atol=atol, rtol=rtol)
+
             label = f"{str(shape):>14}  {str(dtype).split('.')[-1]:<16}"
-            rep.check(label, ok, f"最大误差 {diff:.2e}" if not ok else "")
+            detail = ""
+            if not ok1:
+                detail += f"v1 误差 {max_abs_diff(y_ref, y_v1):.2e} "
+            if not ok2:
+                detail += f"v2 误差 {max_abs_diff(y_ref, y_v2):.2e}"
+            rep.check(label, ok1 and ok2, detail)
 
 
 # ============================================================

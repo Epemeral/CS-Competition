@@ -208,7 +208,86 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 
 # ============================================================
-# 四、自测（需要 GPU）
+# 四、RMSNorm v2：分块归约版（解决大 N 的寄存器爆炸）
+# ============================================================
+# 【为什么需要 v2】
+#   v1 用 BLOCK_N = next_power_of_2(N) 一次性处理整行。
+#   当 N = 18944 时，BLOCK_N = 32768 —— 一个 program 要同时持有 32768 个 fp32，
+#   寄存器严重不足，编译器只能 spill 到 local memory（走 HBM），反而更慢。
+#   实测：(128, 18944) fp32 下 v1 只有 0.54x，比 PyTorch 还慢。
+#
+# 【v2 怎么做】
+#   把 BLOCK_N 固定成一个上限（如 4096），用循环分块处理：
+#     第一遍：循环累加 sum(x²)
+#     第二遍：循环归一化并写出
+#
+#   好处：寄存器压力恒定，不随 N 增长。
+#   代价：x 要读两次 —— 但第二次大概率命中 L2 缓存，比寄存器 spill 便宜得多。
+#
+#   这是 GPU kernel 的经典权衡：**用一点额外的访存，换掉寄存器压力**。
+
+@triton.jit
+def _rmsnorm_loop_kernel(
+    X, W, Y,
+    stride_x_row, stride_y_row,
+    N,
+    eps,
+    BLOCK_N: tl.constexpr,          # 固定上限，不随 N 增长
+):
+    row = tl.program_id(0)
+
+    # ---- 第一遍：循环累加 sum(x²) ----
+    sum_sq = 0.0
+    for off in range(0, N, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)
+        mask = cols < N
+        x = tl.load(X + row * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
+        sum_sq += tl.sum(x * x, axis=0)
+
+    # 注意分母用真实的 N
+    rrms = 1.0 / tl.sqrt(sum_sq / N + eps)
+
+    # ---- 第二遍：归一化并写出 ----
+    for off in range(0, N, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)
+        mask = cols < N
+        x = tl.load(X + row * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+        y = x * rrms * w
+        tl.store(Y + row * stride_y_row + cols, y.to(Y.dtype.element_ty), mask=mask)
+
+
+def rmsnorm_v2(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6,
+               block_cap: int = 4096) -> torch.Tensor:
+    """分块归约版 RMSNorm。
+
+    参数：
+        block_cap : BLOCK_N 的上限。N 小于它时行为和 v1 一样；
+                    N 大于它时循环分块，避免寄存器爆炸。
+    """
+    assert x.is_cuda, "Triton kernel 需要 CUDA/ROCm 设备"
+    x = x.contiguous()
+    N = x.shape[-1]
+
+    x2d = x.view(-1, N)
+    M = x2d.shape[0]
+    y = torch.empty_like(x2d)
+
+    # 关键：BLOCK_N 取 min(N 的 2 次幂, block_cap)，而不是直接用 next_power_of_2(N)
+    BLOCK_N = min(triton.next_power_of_2(N), block_cap)
+    grid = (M,)
+
+    _rmsnorm_loop_kernel[grid](
+        x2d, weight, y,
+        x2d.stride(0), y.stride(0),
+        N, eps,
+        BLOCK_N=BLOCK_N,
+    )
+    return y.view_as(x)
+
+
+# ============================================================
+# 五、自测（需要 GPU）
 # ============================================================
 if __name__ == "__main__":
     import sys
@@ -230,14 +309,17 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"设备: {torch.cuda.get_device_name(0)}")
 
-    # ---- RMSNorm ----
-    for shape in [(4, 8), (32, 128), (8, 100), (1, 4096)]:
+    # ---- RMSNorm（v1 和 v2 都要和参考实现对齐）----
+    for shape in [(4, 8), (32, 128), (8, 100), (1, 4096), (4, 18944)]:
         x = torch.randn(*shape, device=device, dtype=torch.float32)
         w = torch.randn(shape[-1], device=device, dtype=torch.float32)
         y_ref = ref.rmsnorm(x, w, eps=1e-6)
-        y_tri = rmsnorm(x, w, eps=1e-6)
-        ok = torch.allclose(y_ref, y_tri, atol=1e-4, rtol=1e-4)
-        print(f"  rmsnorm {str(shape):>12}  →  {'✅' if ok else '❌ 不一致'}")
+        y_v1 = rmsnorm(x, w, eps=1e-6)
+        y_v2 = rmsnorm_v2(x, w, eps=1e-6)
+        ok1 = torch.allclose(y_ref, y_v1, atol=1e-4, rtol=1e-4)
+        ok2 = torch.allclose(y_ref, y_v2, atol=1e-4, rtol=1e-4)
+        print(f"  rmsnorm {str(shape):>12}   v1 {'✅' if ok1 else '❌'}"
+              f"   v2 {'✅' if ok2 else '❌'}")
 
     # ---- 融合 Add + RMSNorm ----
     for shape in [(4, 8), (32, 128), (8, 100)]:
